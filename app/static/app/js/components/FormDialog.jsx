@@ -17,8 +17,9 @@ class FormDialog extends React.Component {
 
     static propTypes = {
         getFormData: PropTypes.func.isRequired,
-        reset: PropTypes.func.isRequired,
+        reset: PropTypes.func,
         saveAction: PropTypes.func.isRequired,
+        handleSaveFunction: PropTypes.func,
         onShow: PropTypes.func,
         onHide: PropTypes.func,
         deleteAction: PropTypes.func,
@@ -88,35 +89,62 @@ class FormDialog extends React.Component {
     }
 
     show(){
-        this.props.reset();
+        if (this.props.reset) this.props.reset();
         this.setState({showModal: true, saving: false, error: ""});
     }
 
     hide(){
         this.setState({showModal: false});
         if (this.props.onHide) this.props.onHide();
+        if (this.serverRequest){
+            this.serverRequest.abort();
+            this.serverRequest = null;
+        }
+    }
+
+    handleEnter = e => {
+        if (e.key === 'Enter' || e.keyCode === 13){
+          this.handleSave(e);
+        }
     }
 
     handleSave(e){
         e.preventDefault();
 
-        this.setState({saving: true});
+        this.setState({saving: true, error: ""});
 
-        let formData = {};
-        if (this.props.getFormData) formData = this.props.getFormData();
+        if (this.props.handleSaveFunction){
+            this.props.handleSaveFunction(err => {
+                if (!err) this.hide();
+                else{
+                    this.setState({saving: false, error: err.message});
+                }
+            });
+        }else{
+            let formData = {};
+            if (this.props.getFormData) formData = this.props.getFormData();
+    
+            this.serverRequest = this.props.saveAction(formData);
+            if (this.serverRequest){
+                this.serverRequest.fail(e => {
+                    this.setState({error: e.message || (e.responseJSON || {}).detail || (e.responseJSON || {}).error || e.responseText || _("Could not apply changes")});
+                }).always(() => {
+                    this.setState({saving: false});
+                    this.serverRequest = null;
+                }).done(() => {
+                    this.hide();
+                });
+            }else{
+                this.setState({saving: false});
+                this.hide();
+            }
+        }
 
-        this.props.saveAction(formData).fail(e => {
-            this.setState({error: e.message || (e.responseJSON || {}).detail || e.responseText || _("Could not apply changes")});
-        }).always(() => {
-            this.setState({saving: false});
-        }).done(() => {
-            this.hide();
-        });
     }
 
     handleDelete(){
         if (this.props.deleteAction){
-            if (this.props.deleteWarning === false || window.confirm(this.props.deleteWarning)){
+            if (!this.props.deleteWarning || window.confirm(this.props.deleteWarning)){
                 this.setState({deleting: true});
                 this.props.deleteAction()
                     .fail(e => {
@@ -129,6 +157,26 @@ class FormDialog extends React.Component {
     }
 
     render(){
+        let leftButtons = [];
+        if (this.props.deleteAction){
+            leftButtons.push(<button 
+                disabled={this.state.deleting}
+                className="btn btn-danger"
+                key="delete" 
+                onClick={this.handleDelete}>
+                {this.state.deleting ? 
+                    <span>
+                        <i className="fa fa-circle-notch fa-spin"></i><span className="hidden-xs"> {_("Deleting...")}</span>
+                    </span>
+                :   <span>
+                        <i className="fa fa-trash"></i><span className="hidden-xs"> {_("Delete")}</span>
+                    </span>}
+            </button>);
+        }
+        if (this.props.leftButtons){
+            leftButtons = leftButtons.concat(this.props.leftButtons);
+        } 
+
         return (
             <div ref={this.setModal}
                 className="modal form-dialog" tabIndex="-1"
@@ -159,20 +207,10 @@ class FormDialog extends React.Component {
                                 </span>}
                         </button>
                     </div>
-                    {this.props.deleteAction ?
+                    
+                    {leftButtons.length > 0 ?
                         <div className="text-left">
-                            <button 
-                                disabled={this.state.deleting}
-                                className="btn btn-danger" 
-                                onClick={this.handleDelete}>
-                                {this.state.deleting ? 
-                                    <span>
-                                        <i className="fa fa-circle-notch fa-spin"></i> {_("Deleting...")}
-                                    </span>
-                                :   <span>
-                                        <i className="glyphicon glyphicon-trash"></i> {_("Delete")}
-                                    </span>}
-                            </button>
+                            {leftButtons}
                         </div>
                     : ""}
                   </div>

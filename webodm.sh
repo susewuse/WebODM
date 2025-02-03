@@ -1,6 +1,6 @@
 #!/bin/bash
 set -eo pipefail
-__dirname=$(cd $(dirname "$0"); pwd -P)
+__dirname=$(cd "$(dirname "$0")"; pwd -P)
 cd "${__dirname}"
 
 platform="Linux" # Assumed
@@ -18,8 +18,8 @@ if [[ $platform = "Windows" ]]; then
 	export COMPOSE_CONVERT_WINDOWS_PATHS=1
 fi
 
-default_nodes=1
 dev_mode=false
+gpu=false
 
 # define realpath replacement function
 if [[ $platform = "MacOS / OSX" ]]; then
@@ -33,9 +33,11 @@ source "${__dirname}/.env"
 DEFAULT_PORT="$WO_PORT"
 DEFAULT_HOST="$WO_HOST"
 DEFAULT_MEDIA_DIR="$WO_MEDIA_DIR"
+DEFAULT_DB_DIR="$WO_DB_DIR"
 DEFAULT_SSL="$WO_SSL"
 DEFAULT_SSL_INSECURE_PORT_REDIRECT="$WO_SSL_INSECURE_PORT_REDIRECT"
 DEFAULT_BROKER="$WO_BROKER"
+DEFAULT_NODES="$WO_DEFAULT_NODES"
 
 # Parse args for overrides
 POSITIONAL=()
@@ -48,14 +50,21 @@ case $key in
     export WO_PORT="$2"
     shift # past argument
     shift # past value
-    ;;    
+    ;;
     --hostname)
     export WO_HOST="$2"
     shift # past argument
     shift # past value
     ;;
-	--media-dir)
-    export WO_MEDIA_DIR=$(realpath "$2")
+    --media-dir)
+    WO_MEDIA_DIR=$(realpath "$2")
+    export WO_MEDIA_DIR
+    shift # past argument
+    shift # past value
+    ;;
+    --db-dir)
+    WO_DB_DIR=$(realpath "$2")
+    export WO_DB_DIR
     shift # past argument
     shift # past value
     ;;
@@ -63,17 +72,19 @@ case $key in
     export WO_SSL=YES
     shift # past argument
     ;;
-	--ssl-key)
-    export WO_SSL_KEY=$(realpath "$2")
+    --ssl-key)
+    WO_SSL_KEY=$(realpath "$2")
+    export WO_SSL_KEY
     shift # past argument
     shift # past value
     ;;
-	--ssl-cert)
-    export WO_SSL_CERT=$(realpath "$2")
+    --ssl-cert)
+    WO_SSL_CERT=$(realpath "$2")
+    export WO_SSL_CERT
     shift # past argument
     shift # past value
     ;;
-	--ssl-insecure-port-redirect)
+    --ssl-insecure-port-redirect)
     export WO_SSL_INSECURE_PORT_REDIRECT="$2"
     shift # past argument
     shift # past value
@@ -82,19 +93,26 @@ case $key in
     export WO_DEBUG=YES
     shift # past argument
     ;;
+    --dev-watch-plugins)
+    export WO_DEV_WATCH_PLUGINS=YES
+    shift # past argument
+    ;;
     --dev)
     export WO_DEBUG=YES
     export WO_DEV=YES
     dev_mode=true
     shift # past argument
     ;;
-	--broker)
+    --gpu)
+    gpu=true
+    shift # past argument
+    ;;
+    --broker)
     export WO_BROKER="$2"
     shift # past argument
     shift # past value
     ;;
     --no-default-node)
-    default_nodes=0
     echo "ATTENTION: --no-default-node is deprecated. Use --default-nodes instead."
     export WO_DEFAULT_NODES=0
     shift # past argument
@@ -108,8 +126,25 @@ case $key in
     shift # past argument
     ;;
     --default-nodes)
-    default_nodes="$2"
     export WO_DEFAULT_NODES="$2"
+    shift # past argument
+    shift # past value
+    ;;
+    --settings)
+    WO_SETTINGS=$(realpath "$2")
+    export WO_SETTINGS
+    shift # past argument
+    shift # past value
+    ;;    
+    --worker-memory)
+    WO_WORKER_MEMORY="$2"
+    export WO_WORKER_MEMORY
+    shift # past argument
+    shift # past value
+    ;;	
+    --worker-cpus)
+    WO_WORKER_CPUS="$2"
+    export WO_WORKER_CPUS
     shift # past argument
     shift # past value
     ;;
@@ -125,22 +160,24 @@ usage(){
   echo "Usage: $0 <command>"
   echo
   echo "This program helps to manage the setup/teardown of the docker containers for running WebODM. We recommend that you read the full documentation of docker at https://docs.docker.com if you want to customize your setup."
-  echo 
+  echo
   echo "Command list:"
   echo "	start [options]		Start WebODM"
   echo "	stop			Stop WebODM"
   echo "	down			Stop and remove WebODM's docker containers"
   echo "	update			Update WebODM to the latest release"
+  echo "	liveupdate		Update WebODM to the latest release without stopping it"
   echo "	rebuild			Rebuild all docker containers and perform cleanups"
   echo "	checkenv		Do an environment check and install missing components"
   echo "	test			Run the unit test suite (developers only)"
-  echo "	resetadminpassword <new password>	Reset the administrator's password to a new one. WebODM must be running when executing this command."
+  echo "	resetadminpassword \"<new password>\"	Reset the administrator's password to a new one. WebODM must be running when executing this command and the password must be enclosed in double quotes."
   echo ""
   echo "Options:"
   echo "	--port	<port>	Set the port that WebODM should bind to (default: $DEFAULT_PORT)"
   echo "	--hostname	<hostname>	Set the hostname that WebODM will be accessible from (default: $DEFAULT_HOST)"
   echo "	--media-dir	<path>	Path where processing results will be stored to (default: $DEFAULT_MEDIA_DIR (docker named volume))"
-  echo "	--default-nodes	The amount of default NodeODM nodes attached to WebODM on startup (default: 1)"
+  echo "	--db-dir	<path>	Path where the Postgres db data will be stored to (default: $DEFAULT_DB_DIR (docker named volume))"
+  echo "	--default-nodes	The amount of default NodeODM nodes attached to WebODM on startup (default: $DEFAULT_NODES)"
   echo "	--with-micmac	Create a NodeMICMAC node attached to WebODM on startup. Experimental! (default: disabled)"
   echo "	--ssl	Enable SSL and automatically request and install a certificate from letsencrypt.org. (default: $DEFAULT_SSL)"
   echo "	--ssl-key	<path>	Manually specify a path to the private key file (.pem) to use with nginx to enable SSL (default: None)"
@@ -148,32 +185,148 @@ usage(){
   echo "	--ssl-insecure-port-redirect	<port>	Insecure port number to redirect from when SSL is enabled (default: $DEFAULT_SSL_INSECURE_PORT_REDIRECT)"
   echo "	--debug	Enable debug for development environments (default: disabled)"
   echo "	--dev	Enable development mode. In development mode you can make modifications to WebODM source files and changes will be reflected live. (default: disabled)"
+  echo "	--dev-watch-plugins	Automatically build plugins while in dev mode. (default: disabled)"
   echo "	--broker	Set the URL used to connect to the celery broker (default: $DEFAULT_BROKER)"
   echo "	--detached	Run WebODM in detached mode. This means WebODM will run in the background, without blocking the terminal (default: disabled)"
+  echo "	--gpu	Use GPU NodeODM nodes (Linux only) (default: disabled)"
+  echo "	--settings	Path to a settings.py file to enable modifications of system settings (default: None)"
+  echo "	--worker-memory	Maximum amount of memory allocated for the worker process (default: unlimited)"
+  echo "	--worker-cpus	Maximum number of CPUs allocated for the worker process (default: all)"
+  
   exit
 }
 
-# $1 = command | $2 = help_text | $3 = install_command (optional)
+detect_gpus(){
+	export GPU_AMD=false
+	export GPU_INTEL=false
+	export GPU_NVIDIA=false
+
+	if [ "${platform}" = "Linux" ]; then
+		set +e
+		if lspci | grep 'NVIDIA'; then
+			echo "GPU_NVIDIA has been found"
+			export GPU_NVIDIA=true
+			set -e
+			return
+		fi
+
+		if lspci | grep "VGA.*NVIDIA"; then
+			echo "GPU_NVIDIA has been found"
+			export GPU_NVIDIA=true
+			set -e
+			return
+		fi
+		NVIDIA_DEVICE=$(nvidia-smi -L | grep "GPU 0:" | awk -F ': ' '{print $2}' | awk -F '(' '{print $1}')
+		#IF the NVIDIA_DEVICE has the word NVIDIA in it, then enable NVIDIA
+		if [[ $NVIDIA_DEVICE == *"NVIDIA"* ]]; then
+			echo "GPU_NVIDIA has been found"
+			export GPU_NVIDIA=true
+			set -e
+			return
+		fi
+
+		if lspci | grep "VGA.*Intel"; then
+			echo "GPU_INTEL has been found"
+			export GPU_INTEL=true
+			set -e
+			return
+		fi
+
+		# Total guess.  Need to look into AMD.
+		if lspci | grep "VGA.*AMD"; then
+			echo "GPU_AMD has been found"
+			export GPU_AMD=true
+			set -e
+			return
+		fi
+
+		if ! $GPU_NVIDIA && ! $GPU_INTEL && ! $GPU_AMD; then
+			echo "Warning: GPU use was requested, but no GPU has been found"
+			set -e
+		fi
+	else
+		echo "Warning: GPU support is not available for $platform"
+	fi
+}
+
+prepare_intel_render_group(){
+	if [ "${platform}" = "Linux" ]; then
+		if [ "${GPU_INTEL}" = true ]; then
+			RENDER_GROUP_ID=$(getent group render | cut -d":" -f3)
+		else
+			RENDER_GROUP_ID=0
+		fi
+		export RENDER_GROUP_ID
+	fi
+}
+
+if [[ $gpu = true ]]; then
+	detect_gpus
+	prepare_intel_render_group
+fi
+
+docker_compose="docker-compose"
+check_docker_compose(){
+	dc_msg_ok="\033[92m\033[1m OK\033[0m\033[39m"
+
+	# Check if docker-compose exists
+	hash "docker-compose" 2>/dev/null || not_found=true
+	if [[ $not_found ]]; then
+		# Check if compose plugin is installed
+		if ! docker compose > /dev/null 2>&1; then
+
+			if [ "${platform}" = "Linux" ] && [ -z "$1" ] && [ ! -z "$HOME" ]; then
+				echo -e "Checking for docker compose... \033[93mnot found, we'll attempt to install it\033[39m"
+				check_command "curl" "Cannot automatically install docker compose. Please visit https://docs.docker.com/compose/install/" "" "silent"
+				DOCKER_CONFIG=${DOCKER_CONFIG:-$HOME/.docker}
+				mkdir -p $DOCKER_CONFIG/cli-plugins
+				curl -SL# https://github.com/docker/compose/releases/download/v2.17.2/docker-compose-linux-x86_64 -o $DOCKER_CONFIG/cli-plugins/docker-compose
+				chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
+				check_docker_compose "y"
+			else
+				if [ -z "$1" ]; then
+					echo -e "Checking for docker compose... \033[93mnot found, please visit https://docs.docker.com/compose/install/ to install docker compose\033[39m"
+				else
+					echo -e "\033[93mCannot automatically install docker compose. Please visit https://docs.docker.com/compose/install/\033[39m"
+				fi
+				return 1
+			fi
+		else
+			docker_compose="docker compose"
+		fi
+	else
+		docker_compose="docker-compose"
+	fi
+
+	if [ -z "$1" ]; then
+		echo -e "Checking for $docker_compose... $dc_msg_ok"
+	fi
+}
+
+# $1 = command | $2 = help_text | $3 = install_command (optional) | $4 = silent
 check_command(){
 	check_msg_prefix="Checking for $1... "
 	check_msg_result="\033[92m\033[1m OK\033[0m\033[39m"
-
-	hash $1 2>/dev/null || not_found=true 
+	unset not_found
+	hash "$1" 2>/dev/null || not_found=true
 	if [[ $not_found ]]; then
-		
+
 		# Can we attempt to install it?
-		if [[ ! -z "$3" ]]; then
+		if [[ -n "$3" ]]; then
 			echo -e "$check_msg_prefix \033[93mnot found, we'll attempt to install\033[39m"
 			run "$3 || sudo $3"
 
 			# Recurse, but don't pass the install command
-			check_command "$1" "$2"	
+			check_command "$1" "$2"
 		else
 			check_msg_result="\033[91m can't find $1! Check that the program is installed and that you have added the proper path to the program to your PATH environment variable before launching WebODM. If you change your PATH environment variable, remember to close and reopen your terminal. $2\033[39m"
 		fi
 	fi
 
-	echo -e "$check_msg_prefix $check_msg_result"
+	if [ -z "$4" ]; then
+		echo -e "$check_msg_prefix $check_msg_result"
+	fi
+
 	if [[ $not_found ]]; then
 		return 1
 	fi
@@ -181,42 +334,65 @@ check_command(){
 
 environment_check(){
 	check_command "docker" "https://www.docker.com/"
-	check_command "git" "https://git-scm.com/downloads"
-	check_command "docker-compose" "Run \033[1mpip install docker-compose\033[0m" "pip install docker-compose"
+	check_docker_compose
 }
 
 run(){
-	echo $1
-	eval $1
+	echo "$1"
+	eval "$1"
+}
+
+get_secret(){
+	if [ ! -e ./.secret_key ] && [ -e /dev/random ]; then
+		echo "Generating secret in ./.secret_key"
+		export WO_SECRET_KEY=$(head -c50 < /dev/random | base64)
+		echo $WO_SECRET_KEY > ./.secret_key
+	elif [ -e ./.secret_key ]; then
+		export WO_SECRET_KEY=$(cat ./.secret_key)
+	else
+		export WO_SECRET_KEY=""
+	fi
 }
 
 start(){
-    if [[ $dev_mode = true ]]; then
-	    echo "Starting WebODM in development mode..."
-        down
-    else
-        echo "Starting WebODM..."
-    fi
+	get_secret
+
+	if [[ $dev_mode = true ]]; then
+		echo "Starting WebODM in development mode..."
+		down
+	else
+		echo "Starting WebODM..."
+	fi
 	echo ""
 	echo "Using the following environment:"
 	echo "================================"
 	echo "Host: $WO_HOST"
 	echo "Port: $WO_PORT"
 	echo "Media directory: $WO_MEDIA_DIR"
+	echo "Postgres DB directory: $WO_DB_DIR"
 	echo "SSL: $WO_SSL"
 	echo "SSL key: $WO_SSL_KEY"
 	echo "SSL certificate: $WO_SSL_CERT"
 	echo "SSL insecure port redirect: $WO_SSL_INSECURE_PORT_REDIRECT"
 	echo "Celery Broker: $WO_BROKER"
 	echo "Default Nodes: $WO_DEFAULT_NODES"
+	echo "Settings: $WO_SETTINGS"
+	echo "Worker memory limit: $WO_WORKER_MEMORY"
+	echo "Worker cpus limit: $WO_WORKER_CPUS"
 	echo "================================"
 	echo "Make sure to issue a $0 down if you decide to change the environment."
 	echo ""
 
-	command="docker-compose -f docker-compose.yml"
+	command="$docker_compose -f docker-compose.yml"
 
-    if [[ $default_nodes > 0 ]]; then
-        command+=" -f docker-compose.nodeodm.yml"
+    if [[ $WO_DEFAULT_NODES -gt 0 ]]; then
+		if [ "${GPU_NVIDIA}" = true ]; then
+			command+=" -f docker-compose.nodeodm.gpu.nvidia.yml"
+		elif [ "${GPU_INTEL}" = true ]; then
+			command+=" -f docker-compose.nodeodm.gpu.intel.yml"
+		else
+			command+=" -f docker-compose.nodeodm.yml"
+		fi
     fi
 
     if [[ $load_micmac_node = true ]]; then
@@ -226,21 +402,21 @@ start(){
     if [[ $dev_mode = true ]]; then
         command+=" -f docker-compose.dev.yml"
     fi
-	
+
 	if [ "$WO_SSL" = "YES" ]; then
-		if [ ! -z "$WO_SSL_KEY" ] && [ ! -e "$WO_SSL_KEY" ]; then
+		if [ -n "$WO_SSL_KEY" ] && [ ! -e "$WO_SSL_KEY" ]; then
 			echo -e "\033[91mSSL key file does not exist: $WO_SSL_KEY\033[39m"
 			exit 1
 		fi
-		if [ ! -z "$WO_SSL_CERT" ] && [ ! -e "$WO_SSL_CERT" ]; then
+		if [ -n "$WO_SSL_CERT" ] && [ ! -e "$WO_SSL_CERT" ]; then
 			echo -e "\033[91mSSL certificate file does not exist: $WO_SSL_CERT\033[39m"
 			exit 1
 		fi
-		
+
 		command+=" -f docker-compose.ssl.yml"
-		
+
 		method="Lets Encrypt"
-		if [ ! -z "$WO_SSL_KEY" ] && [ ! -z "$WO_SSL_CERT" ]; then
+		if [ -n "$WO_SSL_KEY" ] && [ -n "$WO_SSL_CERT" ]; then
 			method="Manual"
 			command+=" -f docker-compose.ssl-manual.yml"
 		fi
@@ -255,7 +431,7 @@ start(){
 			fi
 			export WO_PORT=443
 		fi
-		
+
 		# Make sure we have a hostname
 		if [ "$WO_HOST" = "localhost" ]; then
 			echo -e "\033[91mSSL is enabled, but hostname cannot be set to $WO_HOST. Set the --hostname argument to the domain of your WebODM server (for example: www.mywebodm.org).\033[39m"
@@ -265,28 +441,56 @@ start(){
 		echo "Will enable SSL ($method)"
 	fi
 
-	command="$command start || $command up"
+	if [ ! -z "$WO_SETTINGS" ]; then
+		if [ ! -e "$WO_SETTINGS" ]; then
+			echo -e "\033[91mSettings file does not exist: $WO_SETTINGS\033[39m"
+			exit 1
+		fi
+		command+=" -f docker-compose.settings.yml"
+	fi
+
+	if [ ! -z "$WO_WORKER_MEMORY" ]; then
+		command+=" -f docker-compose.worker-memory.yml"
+	fi
+
+	if [ ! -z "$WO_WORKER_CPUS" ]; then
+		command+=" -f docker-compose.worker-cpu.yml"
+	fi
+
+	command="$command up"
 
 	if [[ $detached = true ]]; then
 		command+=" -d"
 	fi
 
-	if [[ $default_nodes > 0 ]]; then
-		command+=" --scale node-odm=$default_nodes"
+	if [[ $WO_DEFAULT_NODES -gt 0 ]]; then
+		command+=" --scale node-odm=$WO_DEFAULT_NODES"
 	fi
 
 	run "$command"
 }
 
 down(){
-	run "docker-compose -f docker-compose.yml -f docker-compose.nodeodm.yml -f docker-compose.nodemicmac.yml down --remove-orphans"
+	command="$docker_compose -f docker-compose.yml"
+
+	if [ "${GPU_NVIDIA}" = true ]; then
+		command+=" -f docker-compose.nodeodm.gpu.nvidia.yml"
+	elif [ "${GPU_INTEL}" = true ]; then
+		command+=" -f docker-compose.nodeodm.gpu.intel.yml"
+	else
+		command+=" -f docker-compose.nodeodm.yml"
+	fi
+
+	command+=" -f docker-compose.nodemicmac.yml down --remove-orphans"
+
+	run "${command}"
 }
 
 rebuild(){
-	run "docker-compose down --remove-orphans"
+	run "$docker_compose down --remove-orphans"
 	run "rm -fr node_modules/ || sudo rm -fr node_modules/"
 	run "rm -fr nodeodm/external/NodeODM || sudo rm -fr nodeodm/external/NodeODM"
-	run "docker-compose -f docker-compose.yml -f docker-compose.build.yml build --no-cache"
+	run "$docker_compose -f docker-compose.yml -f docker-compose.build.yml build --no-cache"
 	#run "docker images --no-trunc -aqf \"dangling=true\" | xargs docker rmi"
 	echo -e "\033[1mDone!\033[0m You can now start WebODM by running $0 start"
 }
@@ -305,22 +509,21 @@ run_tests(){
         echo -e "\033[1mDone!\033[0m Everything looks in order."
     else
         echo "Running tests in webapp container"
-        run "docker-compose exec webapp /bin/bash -c \"/webodm/webodm.sh test\""
+        run "$docker_compose exec webapp /bin/bash -c \"/webodm/webodm.sh test\""
     fi
 }
 
 resetpassword(){
 	newpass=$1
 
-	if [[ ! -z "$newpass" ]]; then
+	if [[ -n "$newpass" ]]; then
 		container_hash=$(docker ps -q --filter "name=webapp")
 		if [[ -z "$container_hash" ]]; then
 			echo -e "\033[91mCannot find webapp docker container. Is WebODM running?\033[39m"
 			exit 1
 		fi
 
-		docker exec $container_hash bash -c "echo \"from django.contrib.auth.models import User;from django.contrib.auth.hashers import make_password;u=User.objects.filter(is_superuser=True)[0];u.password=make_password('$newpass');u.save();print('The following user was changed: {}'.format(u.username));\" | python manage.py shell"
-		if [[ "$?" -eq 0 ]]; then
+		if docker exec "$container_hash" bash -c "echo \"from django.contrib.auth.models import User;from django.contrib.auth.hashers import make_password;u=User.objects.filter(is_superuser=True)[0];u.password=make_password('$newpass');u.save();print('The following user was changed: {}'.format(u.username));\" | python manage.py shell"; then
 			echo -e "\033[1mPassword changed!\033[0m"
 		else
 			echo -e "\033[91mCould not change administrator password. If you need help, please visit https://github.com/OpenDroneMap/WebODM/issues/ \033[39m"
@@ -330,13 +533,59 @@ resetpassword(){
 	fi
 }
 
+update(){
+	echo "Updating WebODM..."
+
+	hash git 2>/dev/null || git_not_found=true
+	if [[ $git_not_found ]]; then
+		echo "Skipping source update (git not found)"
+	else
+		if [[ -d .git ]]; then
+			run "git pull origin master"
+		else
+			echo "Skipping source update (.git directory not found)"
+		fi
+	fi
+
+	command="$docker_compose -f docker-compose.yml"
+
+	if [[ $WO_DEFAULT_NODES -gt 0 ]]; then
+		if [ "${GPU_NVIDIA}" = true ]; then
+			command+=" -f docker-compose.nodeodm.gpu.nvidia.yml"
+		elif [ "${GPU_INTEL}" = true ]; then
+			command+=" -f docker-compose.nodeodm.gpu.intel.yml"
+		else
+			command+=" -f docker-compose.nodeodm.yml"
+		fi
+	fi
+
+	if [[ $load_micmac_node = true ]]; then
+		command+=" -f docker-compose.nodemicmac.yml"
+	fi
+
+	command+=" pull"
+	run "$command"
+}
+
 if [[ $1 = "start" ]]; then
 	environment_check
 	start
 elif [[ $1 = "stop" ]]; then
 	environment_check
 	echo "Stopping WebODM..."
-	run "docker-compose -f docker-compose.yml -f docker-compose.nodeodm.yml -f docker-compose.nodemicmac.yml stop"
+
+	command="$docker_compose -f docker-compose.yml"
+
+	if [ "${GPU_NVIDIA}" = true ]; then
+		command+=" -f docker-compose.nodeodm.gpu.nvidia.yml"
+	elif [ "${GPU_INTEL}" = true ]; then
+		command+=" -f docker-compose.nodeodm.gpu.intel.yml"
+	else
+		command+=" -f docker-compose.nodeodm.yml"
+	fi
+
+	command+=" -f docker-compose.nodemicmac.yml stop"
+	run "${command}"
 elif [[ $1 = "restart" ]]; then
 	environment_check
 	echo "Restarting WebODM..."
@@ -351,29 +600,20 @@ elif [[ $1 = "rebuild" ]]; then
 	echo  "Rebuilding WebODM..."
 	rebuild
 elif [[ $1 = "update" ]]; then
+	environment_check
 	down
-	echo "Updating WebODM..."
-	run "git pull origin master"
-
-	command="docker-compose -f docker-compose.yml"
-
-	if [[ $default_nodes > 0 ]]; then
-		command+=" -f docker-compose.nodeodm.yml"
-	fi
-
-	if [[ $load_micmac_node = true ]]; then
-		command+=" -f docker-compose.nodemicmac.yml"
-	fi
-
-	command+=" pull"
-	run "$command"
+	update
 	echo -e "\033[1mDone!\033[0m You can now start WebODM by running $0 start"
+elif [[ $1 = "liveupdate" ]]; then
+	environment_check
+	update
+	echo -e "\033[1mDone!\033[0m You can now finish the update by running $0 restart"
 elif [[ $1 = "checkenv" ]]; then
 	environment_check
 elif [[ $1 = "test" ]]; then
 	run_tests
 elif [[ $1 = "resetadminpassword" ]]; then
-	resetpassword $2
+	resetpassword "$2"
 else
 	usage
 fi

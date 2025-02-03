@@ -4,8 +4,6 @@ import '../css/Map.scss';
 import 'leaflet/dist/leaflet.css';
 import Leaflet from 'leaflet';
 import async from 'async';
-import '../vendor/leaflet/L.Control.MousePosition.css';
-import '../vendor/leaflet/L.Control.MousePosition';
 import '../vendor/leaflet/Leaflet.Autolayers/css/leaflet.auto-layers.css';
 import '../vendor/leaflet/Leaflet.Autolayers/leaflet-autolayers';
 // import '../vendor/leaflet/L.TileLayer.NoGap';
@@ -13,6 +11,7 @@ import Dropzone from '../vendor/dropzone';
 import $ from 'jquery';
 import ErrorMessage from './ErrorMessage';
 import ImagePopup from './ImagePopup';
+import GCPPopup from './GCPPopup';
 import SwitchModeButton from './SwitchModeButton';
 import ShareButton from './ShareButton';
 import AssetDownloads from '../classes/AssetDownloads';
@@ -25,21 +24,32 @@ import LayersControl from './LayersControl';
 import update from 'immutability-helper';
 import Utils from '../classes/Utils';
 import '../vendor/leaflet/Leaflet.Ajax';
-import '../vendor/leaflet/Leaflet.Awesome-markers';
+import 'rbush';
+import '../vendor/leaflet/leaflet-markers-canvas';
 import { _ } from '../classes/gettext';
+import UnitSelector from './UnitSelector';
+import { unitSystem, toMetric } from '../classes/Units';
 
 class Map extends React.Component {
   static defaultProps = {
     showBackground: false,
     mapType: "orthophoto",
-    public: false
+    public: false,
+    publicEdit: false,
+    shareButtons: true,
+    permissions: ["view"],
+    thermal: false
   };
 
   static propTypes = {
     showBackground: PropTypes.bool,
     tiles: PropTypes.array.isRequired,
     mapType: PropTypes.oneOf(['orthophoto', 'plant', 'dsm', 'dtm']),
-    public: PropTypes.bool
+    public: PropTypes.bool,
+    publicEdit: PropTypes.bool,
+    shareButtons: PropTypes.bool,
+    permissions: PropTypes.array,
+    thermal: PropTypes.bool
   };
 
   constructor(props) {
@@ -52,13 +62,14 @@ class Map extends React.Component {
       showLoading: false, // for drag&drop of files and first load
       opacity: 100,
       imageryLayers: [],
-      overlays: []
+      overlays: [],
+      annotations: []
     };
 
     this.basemaps = {};
     this.mapBounds = null;
     this.autolayers = null;
-    this.addedCameraShots = false;
+    this.addedCameraShots = {};
 
     this.loadImageryLayers = this.loadImageryLayers.bind(this);
     this.updatePopupFor = this.updatePopupFor.bind(this);
@@ -76,18 +87,49 @@ class Map extends React.Component {
     $('#layerOpacity', popup.getContent()).val(layer.options.opacity);
   }
 
+  tdPopupButtonUrl = (task) => {
+    if (this.props.public){
+      return `/public/task/${task.id}/3d/`;
+    }else{
+      return `/3d/project/${task.project}/task/${task.id}/`;
+    }
+  }
+
   typeToHuman = (type) => {
       switch(type){
           case "orthophoto":
               return _("Orthophoto");
           case "plant":
-              return _("Plant Health");
+              return this.props.thermal ? _("Thermal") : _("Plant Health");
           case "dsm":
               return _("DSM");
           case "dtm":
               return _("DTM");
       }
       return "";
+  }
+
+  typeToIcon = (type) => {
+    switch(type){
+        case "orthophoto":
+            return "far fa-image fa-fw"
+        case "plant":
+            return this.props.thermal ? "fa fa-thermometer-half fa-fw" : "fa fa-seedling fa-fw";
+        case "dsm":
+        case "dtm":
+            return "fa fa-chart-area fa-fw";
+    }
+    return "";
+  }
+
+  hasBands = (bands, orthophoto_bands) => {
+    if (!orthophoto_bands) return false;
+
+    for (let i = 0; i < bands.length; i++){
+      if (orthophoto_bands.find(b => b.description !== null && b.description.toLowerCase() === bands[i].toLowerCase()) === undefined) return false;
+    }
+    
+    return true;
   }
 
   loadImageryLayers(forceAddLayers = false){
@@ -121,9 +163,32 @@ class Map extends React.Component {
         const { url, meta, type } = tile;
         
         let metaUrl = url + "metadata";
+        let unitForward = value => value;
+        let unitBackward = value => value;
 
-        if (type == "plant") metaUrl += "?formula=NDVI&bands=RGN&color_map=rdylgn";
-        if (type == "dsm" || type == "dtm") metaUrl += "?hillshade=6&color_map=jet";
+        if (type == "plant"){
+          if (meta.task && meta.task.orthophoto_bands && meta.task.orthophoto_bands.length === 2){
+            // Single band, probably thermal dataset, in any case we can't render NDVI
+            // because it requires 3 bands
+            metaUrl += "?formula=Celsius&bands=L&color_map=magma";
+          }else if (meta.task && meta.task.orthophoto_bands){
+            let formula = this.hasBands(["red", "green", "nir"], meta.task.orthophoto_bands) ? "NDVI" : "VARI";
+            metaUrl += `?formula=${formula}&bands=auto&color_map=rdylgn`;
+          }else{
+            // This should never happen?
+            metaUrl += "?formula=NDVI&bands=RGN&color_map=rdylgn";
+          }
+        }else if (type == "dsm" || type == "dtm"){
+          metaUrl += "?hillshade=6&color_map=viridis";
+          unitForward = value => {
+            return unitSystem().elevation(value).value;
+          };
+          unitBackward = value => {
+            let unitValue = unitSystem().elevation(0);
+            unitValue.value = value;
+            return toMetric(unitValue).value;
+          };
+        }
 
         this.tileJsonRequests.push($.getJSON(metaUrl)
           .done(mres => {
@@ -135,19 +200,38 @@ class Map extends React.Component {
 
             // Build URL
             let tileUrl = mres.tiles[0];
+            const TILESIZE = 512;
             
             // Set rescale
             if (statistics){
                 const params = Utils.queryParams({search: tileUrl.slice(tileUrl.indexOf("?"))});
                 if (statistics["1"]){
                     // Add rescale
-                    params["rescale"] = encodeURIComponent(`${statistics["1"]["min"]},${statistics["1"]["max"]}`);              
+                    let min = Infinity;
+                    let max = -Infinity;
+                    if (type === 'plant'){
+                      // percentile
+                      for (let b in statistics){
+                        min = Math.min(statistics[b]["percentiles"][0]);
+                        max = Math.max(statistics[b]["percentiles"][1]);
+                      }
+                    }else{
+                      // min/max
+                      for (let b in statistics){
+                        min = Math.min(statistics[b]["min"]);
+                        max = Math.max(statistics[b]["max"]);
+                      }
+                    }
+                    params["rescale"] = encodeURIComponent(`${min},${max}`);              
                 }else{
                     console.warn("Cannot find min/max statistics for dataset, setting to -1,1");
                     params["rescale"] = encodeURIComponent("-1,1");
                 }
                 
+                params["size"] = TILESIZE;
                 tileUrl = Utils.buildUrlWithQuery(tileUrl, params);
+            }else{
+                tileUrl = Utils.buildUrlWithQuery(tileUrl, { size: TILESIZE });
             }
 
             const layer = Leaflet.tileLayer(tileUrl, {
@@ -155,14 +239,22 @@ class Map extends React.Component {
                   minZoom: 0,
                   maxZoom: maxzoom + 99,
                   maxNativeZoom: maxzoom - 1,
+                  tileSize: TILESIZE,
                   tms: scheme === 'tms',
                   opacity: this.state.opacity / 100,
                   detectRetina: true
                 });
             
             // Associate metadata with this layer
-            meta.name = name + ` (${this.typeToHuman(type)})`;
+            meta.name = this.typeToHuman(type);
+            meta.icon = this.typeToIcon(type);
             meta.metaUrl = metaUrl;
+            meta.unitForward = unitForward;
+            meta.unitBackward = unitBackward;
+            if (this.props.tiles.length > 1){
+              // Assign to a group
+              meta.group = {id: meta.task.id, name: meta.task.name};
+            }
             layer[Symbol.for("meta")] = meta;
             layer[Symbol.for("tile-meta")] = mres;
 
@@ -197,7 +289,7 @@ class Map extends React.Component {
                                 </ul>
 
                                 <button
-                                    onclick="location.href='/3d/project/${meta.task.project}/task/${meta.task.id}/';"
+                                    onclick="location.href='${this.tdPopupButtonUrl(meta.task)}';"
                                     type="button"
                                     class="switchModeButton btn btn-sm btn-secondary">
                                     <i class="fa fa-cube"></i> 3D
@@ -218,51 +310,111 @@ class Map extends React.Component {
             this.mapBounds = mapBounds;
 
             // Add camera shots layer if available
-            if (meta.task && meta.task.camera_shots && !this.addedCameraShots){
-                const cameraMarker = L.AwesomeMarkers.icon({
-                    icon: 'camera',
-                    markerColor: 'blue',
-                    prefix: 'fa'
+            if (meta.task && meta.task.camera_shots && !this.addedCameraShots[meta.task.id]){
+                var camIcon = L.icon({
+                  iconUrl: "/static/app/js/icons/marker-camera.png",
+                  iconSize: [41, 46],
+                  iconAnchor: [17, 46],
                 });
+                
+                const shotsLayer = new L.MarkersCanvas();
+                $.getJSON(meta.task.camera_shots)
+                  .done((shots) => {
+                    if (shots.type === 'FeatureCollection'){
+                      let markers = [];
 
-                const shotsLayer = new L.GeoJSON.AJAX(meta.task.camera_shots, {
-                    style: function (feature) {
-                      return {
-                        opacity: 1,
-                        fillOpacity: 0.7,
-                        color: "#000000"
-                      }
-                    },
-                    pointToLayer: function (feature, latlng) {
-                      return L.marker(latlng, {
-                        icon: cameraMarker
-                      });
-                    },
-                    onEachFeature: function (feature, layer) {
-                        if (feature.properties && feature.properties.filename) {
-                            let root = null;
-                            const lazyrender = () => {
-                                if (!root) root = document.createElement("div");
-                                ReactDOM.render(<ImagePopup task={meta.task} feature={feature}/>, root);
-                                return root;
-                            }
+                      shots.features.forEach(s => {
+                        let marker = L.marker(
+                          [s.geometry.coordinates[1], s.geometry.coordinates[0]],
+                          { icon: camIcon }
+                        );
+                        markers.push(marker);
 
-                            layer.bindPopup(L.popup(
-                                {
-                                    lazyrender,
-                                    maxHeight: 450,
-                                    minWidth: 320
-                                }));
+                        if (s.properties && s.properties.filename){
+                          let root = null;
+                          const lazyrender = () => {
+                              if (!root) root = document.createElement("div");
+                              ReactDOM.render(<ImagePopup task={meta.task} feature={s}/>, root);
+                              return root;
+                          }
+
+                          marker.bindPopup(L.popup(
+                              {
+                                  lazyrender,
+                                  maxHeight: 450,
+                                  minWidth: 320
+                              }));
                         }
+                      });
+
+                      shotsLayer.addMarkers(markers, this.map);
                     }
-                });
-                shotsLayer[Symbol.for("meta")] = {name: name + " " + _("(Cameras)"), icon: "fa fa-camera fa-fw"};
+                  });
+                shotsLayer[Symbol.for("meta")] = {name: _("Cameras"), icon: "fa fa-camera fa-fw"};
+                if (this.props.tiles.length > 1){
+                  // Assign to a group
+                  shotsLayer[Symbol.for("meta")].group = {id: meta.task.id, name: meta.task.name};
+                }
 
                 this.setState(update(this.state, {
                     overlays: {$push: [shotsLayer]}
                 }));
 
-                this.addedCameraShots = true;
+                this.addedCameraShots[meta.task.id] = true;
+            }
+
+            // Add ground control points layer if available
+            if (meta.task && meta.task.ground_control_points && !this.addedGroundControlPoints){
+                const gcpIcon = L.icon({
+                  iconUrl: "/static/app/js/icons/marker-gcp.png",
+                  iconSize: [41, 46],
+                  iconAnchor: [17, 46],
+                });
+                
+                const gcpLayer = new L.MarkersCanvas();
+                $.getJSON(meta.task.ground_control_points)
+                  .done((gcps) => {
+                    if (gcps.type === 'FeatureCollection'){
+                      let markers = [];
+
+                      gcps.features.forEach(gcp => {
+                        let marker = L.marker(
+                          [gcp.geometry.coordinates[1], gcp.geometry.coordinates[0]],
+                          { icon: gcpIcon }
+                        );
+                        markers.push(marker);
+
+                        if (gcp.properties && gcp.properties.observations){
+                          let root = null;
+                          const lazyrender = () => {
+                                if (!root) root = document.createElement("div");
+                                ReactDOM.render(<GCPPopup task={meta.task} feature={gcp}/>, root);
+                                return root;
+                          }
+
+                          marker.bindPopup(L.popup(
+                              {
+                                  lazyrender,
+                                  maxHeight: 450,
+                                  minWidth: 320
+                              }));
+                        }
+                      });
+
+                      gcpLayer.addMarkers(markers, this.map);
+                    }
+                  });
+                gcpLayer[Symbol.for("meta")] = {name: _("Ground Control Points"), icon: "far fa-dot-circle fa-fw"};
+                if (this.props.tiles.length > 1){
+                  // Assign to a group
+                  gcpLayer[Symbol.for("meta")].group = {id: meta.task.id, name: meta.task.name};
+                }
+
+                this.setState(update(this.state, {
+                    overlays: {$push: [gcpLayer]}
+                }));
+
+                this.addedGroundControlPoints = true;
             }
 
             done();
@@ -285,7 +437,7 @@ class Map extends React.Component {
 
     this.map = Leaflet.map(this.container, {
       scrollWheelZoom: true,
-      positionControl: true,
+      positionControl: false,
       zoomControl: false,
       minZoom: 0,
       maxZoom: 24
@@ -295,14 +447,28 @@ class Map extends React.Component {
     // leaflet bug?
     $(this.container).addClass("leaflet-touch");
 
+    PluginsAPI.Map.onAddAnnotation(this.handleAddAnnotation);
+    PluginsAPI.Map.onAnnotationDeleted(this.handleDeleteAnnotation);
+
     PluginsAPI.Map.triggerWillAddControls({
         map: this.map,
-        tiles
+        tiles,
+        mapView: this
     });
 
-    let scaleControl = Leaflet.control.scale({
-      maxWidth: 250,
-    }).addTo(this.map);
+    const UnitsCtrl = Leaflet.Control.extend({
+      options: {
+          position: 'bottomleft'
+      },
+  
+      onAdd: function () {
+          this.container = Leaflet.DomUtil.create('div', 'leaflet-control-units-selection leaflet-control');
+          Leaflet.DomEvent.disableClickPropagation(this.container);
+          ReactDOM.render(<UnitSelector />, this.container);
+          return this.container;
+      }
+    });
+    new UnitsCtrl().addTo(this.map);
 
     //add zoom control with your options
     let zoomControl = Leaflet.control.zoom({
@@ -328,12 +494,14 @@ class Map extends React.Component {
 
       const customLayer = L.layerGroup();
       customLayer.on("add", a => {
+        const defaultCustomBm = window.localStorage.getItem('lastCustomBasemap') || 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+      
         let url = window.prompt([_('Enter a tile URL template. Valid coordinates are:'),
 _('{z}, {x}, {y} for Z/X/Y tile scheme'),
 _('{-y} for flipped TMS-style Y coordinates'),
 '',
 _('Example:'),
-'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png'].join("\n"), 'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png');
+'https://tile.openstreetmap.org/{z}/{x}/{y}.png'].join("\n"), defaultCustomBm);
         
         if (url){
           customLayer.clearLayers();
@@ -344,6 +512,7 @@ _('Example:'),
           });
           customLayer.addLayer(l);
           l.bringToBack();
+          window.localStorage.setItem('lastCustomBasemap', url);
         }
       });
       this.basemaps[_("Custom")] = customLayer;
@@ -352,7 +521,8 @@ _('Example:'),
 
     this.layersControl = new LayersControl({
         layers: this.state.imageryLayers,
-        overlays: this.state.overlays
+        overlays: this.state.overlays,
+        annotations: this.state.annotations
     }).addTo(this.map);
 
     this.autolayers = Leaflet.control.autolayers({
@@ -408,7 +578,11 @@ _('Example:'),
     });
     new AddOverlayCtrl().addTo(this.map);
 
-    this.map.fitWorld();
+    this.map.fitBounds([
+     [13.772919746115805,
+     45.664640939831735],
+     [13.772825784981254,
+     45.664591558975154]]);
     this.map.attributionControl.setPrefix("");
 
     this.setState({showLoading: true});
@@ -417,6 +591,8 @@ _('Example:'),
         this.map.fitBounds(this.mapBounds);
 
         this.map.on('click', e => {
+          if (PluginsAPI.Map.handleClick(e)) return;
+          
           // Find first tile layer at the selected coordinates 
           for (let layer of this.state.imageryLayers){
             if (layer._map && layer.options.bounds.contains(e.latlng)){
@@ -470,7 +646,6 @@ _('Example:'),
       tiles: tiles,
       controls:{
         autolayers: this.autolayers,
-        scale: scaleControl,
         zoom: zoomControl
       }
     });
@@ -485,6 +660,25 @@ _('Example:'),
     });
   }
 
+  handleAddAnnotation = (layer, name, task) => {
+      const meta = {
+        name: name || "", 
+        icon: "fa fa-sticky-note fa-fw"
+      };
+      if (this.props.tiles.length > 1 && task){
+        meta.group = {id: task.id, name: task.name};
+      }
+      layer[Symbol.for("meta")] = meta;
+
+      this.setState(update(this.state, {
+        annotations: {$push: [layer]}
+     }));
+  }
+
+  handleDeleteAnnotation = (layer) => {
+    this.setState({annotations: this.state.annotations.filter(l => l !== layer)});
+  }
+
   componentDidUpdate(prevProps, prevState) {
     this.state.imageryLayers.forEach(imageryLayer => {
       imageryLayer.setOpacity(this.state.opacity / 100);
@@ -496,8 +690,9 @@ _('Example:'),
     }
 
     if (this.layersControl && (prevState.imageryLayers !== this.state.imageryLayers ||
-                            prevState.overlays !== this.state.overlays)){
-        this.layersControl.update(this.state.imageryLayers, this.state.overlays);
+                            prevState.overlays !== this.state.overlays ||
+                            prevState.annotations !== this.state.annotations)){
+        this.layersControl.update(this.state.imageryLayers, this.state.overlays, this.state.annotations);
     }
   }
 
@@ -508,6 +703,10 @@ _('Example:'),
       this.tileJsonRequests.forEach(tileJsonRequest => tileJsonRequest.abort());
       this.tileJsonRequests = [];
     }
+
+    PluginsAPI.Map.offAddAnnotation(this.handleAddAnnotation);
+    PluginsAPI.Map.offAnnotationDeleted(this.handleAddAnnotation);
+    
   }
 
   handleMapMouseDown(e){
@@ -520,7 +719,7 @@ _('Example:'),
       <div style={{height: "100%"}} className="map">
         <ErrorMessage bind={[this, 'error']} />
         <div className="opacity-slider theme-secondary hidden-xs">
-            {_("Opacity:")} <input type="range" step="1" value={this.state.opacity} onChange={this.updateOpacity} />
+            <div className="opacity-slider-label">{_("Opacity:")}</div> <input type="range" step="1" value={this.state.opacity} onChange={this.updateOpacity} />
         </div>
 
         <Standby 
@@ -536,11 +735,12 @@ _('Example:'),
 
         <div className="actionButtons">
           {this.state.pluginActionButtons.map((button, i) => <div key={i}>{button}</div>)}
-          {(!this.props.public && this.state.singleTask !== null) ? 
+          {(this.props.shareButtons && !this.props.public && this.state.singleTask !== null) ? 
             <ShareButton 
               ref={(ref) => { this.shareButton = ref; }}
               task={this.state.singleTask} 
               linksTarget="map"
+              queryParams={{t: this.props.mapType}}
             />
           : ""}
           <SwitchModeButton 

@@ -10,21 +10,79 @@ import PropTypes from 'prop-types';
 import * as THREE from 'THREE';
 import $ from 'jquery';
 import { _, interpolate } from './classes/gettext';
+import { getUnitSystem, setUnitSystem } from './classes/Units';
 
 require('./vendor/OBJLoader');
 require('./vendor/MTLLoader');
-require('./vendor/ColladaLoader');
+require('./vendor/GLTFLoader');
+require('./vendor/DRACOLoader');
+
+class SetCameraView extends React.Component{
+    static propTypes = {
+        viewer: PropTypes.object.isRequired,
+        task: PropTypes.object.isRequired
+    }
+
+    constructor(props){
+        super(props);
+        
+        this.state = {
+            error: "",
+            showOk: false
+        }
+    }
+
+    handleClick = () => {
+        const { view } = Potree.saveProject(this.props.viewer);
+        const showError = () => {
+            this.setState({error: _("Cannot set initial camera view")});
+            setTimeout(() => this.setState({error: ""}), 3000);
+        };
+        const showOk = () => {
+            this.setState({showOk: true});
+            setTimeout(() => this.setState({showOk: false}), 2000);
+        }
+
+        $.ajax({
+            url: `/api/projects/${this.props.task.project}/tasks/${this.props.task.id}/3d/cameraview`,
+            contentType: 'application/json',
+            data: JSON.stringify(view),
+            dataType: 'json',
+            type: 'POST'
+          }).done(result => {
+            if (result.success) showOk();
+            else showError();
+          }).fail(() => {
+            showError();
+          });
+    }
+
+    render(){
+        return ([<input key="btn" type="button" onClick={this.handleClick} 
+                    style={{marginBottom: 12, display: 'inline-block'}} name="set_camera_view" 
+                    value={_("set initial camera view")} />,
+                this.state.showOk ? (<div key="ok" style={{color: 'lightgreen', display: 'inline-block', marginLeft: 12}}>✓</div>) : "",
+                this.state.error ? (<div key="error" style={{color: 'red'}}>{this.state.error}</div>) : ""
+                ]
+        );
+    }
+}
 
 class TexturedModelMenu extends React.Component{
     static propTypes = {
-        toggleTexturedModel: PropTypes.func.isRequired
+        toggleTexturedModel: PropTypes.func.isRequired,
+        selected: PropTypes.bool
+    }
+
+    static defaultProps = {
+        selected: false
     }
 
     constructor(props){
         super(props);
 
         this.state = {
-            showTexturedModel: false
+            showTexturedModel: props.selected
         }
         
         // Translation for sidebar.html
@@ -75,12 +133,16 @@ class CamerasMenu extends React.Component{
 class ModelView extends React.Component {
   static defaultProps = {
     task: null,
-    public: false
+    public: false,
+    shareButtons: true,
+    modelType: "cloud"
   };
 
   static propTypes = {
       task: PropTypes.object.isRequired, // The object should contain two keys: {id: <taskId>, project: <projectId>}
-      public: PropTypes.bool // Is the view being displayed via a shared link?
+      public: PropTypes.bool, // Is the view being displayed via a shared link?
+      shareButtons: PropTypes.bool,
+      modelType: PropTypes.oneOf(['cloud', 'mesh'])
   };
 
   constructor(props){
@@ -88,22 +150,19 @@ class ModelView extends React.Component {
 
     this.state = {
       error: "",
-      showTexturedModel: false,
+      showingTexturedModel: false,
       initializingModel: false,
       selectedCamera: null,
+      modalOpen: false
     };
 
     this.pointCloud = null;
     this.modelReference = null;
 
-    this.toggleTexturedModel = this.toggleTexturedModel.bind(this);
-    this.toggleCameras = this.toggleCameras.bind(this);
-    
-
     this.cameraMeshes = [];
   }
 
-  assetsPath(){
+  assetsPath = () => {
     return `/api/projects/${this.props.task.project}/tasks/${this.props.task.id}/assets`
   }
 
@@ -170,23 +229,28 @@ class ModelView extends React.Component {
     });
   }
 
-  texturedModelDirectoryPath(){
+  texturedModelDirectoryPath = () => {
     return this.assetsPath() + '/odm_texturing/';
   }
 
-  hasGeoreferencedAssets(){
+  hasGeoreferencedAssets = () => {
     return this.props.task.available_assets.indexOf('orthophoto.tif') !== -1;
   }
 
-  hasTexturedModel(){
+  hasTexturedModel = () => {
     return this.props.task.available_assets.indexOf('textured_model.zip') !== -1;
   }
 
-  hasCameras(){
+  getTexturedModelType = () => {
+    if (this.props.task.available_assets.indexOf('textured_model.glb') !== -1) return 'gltf';
+    else return 'obj';
+  }
+
+  hasCameras = () => {
     return this.props.task.available_assets.indexOf('shots.geojson') !== -1;
   }
 
-  objFilePath(cb){
+  objFilePath = (cb) => {
     // Mostly for backward compatibility
     // as newer versions of ODM do not have 
     // a odm_textured_model.obj
@@ -203,7 +267,11 @@ class ModelView extends React.Component {
     });
   }
 
-  mtlFilename(cb){
+  glbFilePath = () => {
+    return this.texturedModelDirectoryPath() + 'odm_textured_model_geo.glb';
+  }
+
+  mtlFilename = (cb) => {
     // Mostly for backward compatibility
     // as newer versions of ODM do not have 
     // a odm_textured_model.mtl
@@ -219,6 +287,18 @@ class ModelView extends React.Component {
     });
   }
 
+  getSceneData(){
+      let json = Potree.saveProject(window.viewer);
+
+      // Remove view, settings since we don't want to trigger
+      // scene updates when these change.
+      delete json.view;
+      delete json.settings;
+      delete json.cameraAnimations;
+
+      return json;
+  }
+
   componentDidMount() {
     let container = this.container;
     if (!container) return; // Enzyme tests don't have support for all WebGL methods so we just skip this
@@ -226,9 +306,23 @@ class ModelView extends React.Component {
     window.viewer = new Potree.Viewer(container);
     viewer.setEDLEnabled(true);
     viewer.setFOV(60);
-    viewer.setPointBudget(1*1000*1000);
+    viewer.setPointBudget(10*1000*1000);
     viewer.setEDLEnabled(true);
     viewer.loadSettingsFromURL();
+
+    const currentUnit = getUnitSystem();
+    const origSetUnit = viewer.setLengthUnitAndDisplayUnit;
+    viewer.setLengthUnitAndDisplayUnit = (lengthUnit, displayUnit) => {
+        if (displayUnit === 'm') setUnitSystem('metric');
+        else if (displayUnit === 'ft'){
+            // Potree doesn't have US/international imperial, so 
+            // we default to international unless the user has previously
+            // selected US
+            if (currentUnit === 'metric') setUnitSystem("imperial");
+            else setUnitSystem(currentUnit);
+        }
+        origSetUnit.call(viewer, lengthUnit, displayUnit);
+    };
         
     viewer.loadGUI(() => {
       viewer.setLanguage('en');
@@ -236,7 +330,7 @@ class ModelView extends React.Component {
       viewer.toggleSidebar();
 
       if (this.hasTexturedModel()){
-          window.ReactDOM.render(<TexturedModelMenu toggleTexturedModel={this.toggleTexturedModel}/>, $("#textured_model_button").get(0));
+          window.ReactDOM.render(<TexturedModelMenu selected={this.props.modelType === 'mesh'} toggleTexturedModel={this.toggleTexturedModel}/>, $("#textured_model_button").get(0));
       }else{
           $("#textured_model").hide();
           $("#textured_model_container").hide();
@@ -248,6 +342,12 @@ class ModelView extends React.Component {
           $("#cameras").hide();
           $("#cameras_container").hide();
       }
+
+      if (!this.props.public){
+          const $scv = $("<div id='set-camera-view'></div>");
+          $scv.prependTo($("#scene_export").parent());
+          window.ReactDOM.render(<SetCameraView viewer={viewer} task={this.props.task} />, $scv.get(0));
+      }
     });
 
     viewer.scene.scene.add( new THREE.AmbientLight( 0x404040, 2.0 ) ); // soft white light );
@@ -257,11 +357,16 @@ class ModelView extends React.Component {
     directional.position.z = 99999999999;
     viewer.scene.scene.add( directional );
 
-    this.pointCloudFilePath(pointCloudPath => {
+    this.pointCloudFilePath(pointCloudPath =>{ 
         Potree.loadPointCloud(pointCloudPath, "Point Cloud", e => {
           if (e.type == "loading_failed"){
             this.setState({error: "Could not load point cloud. This task doesn't seem to have one. Try processing the task again."});
             return;
+          }
+
+          // Automatically load 3D model if required
+          if (this.hasTexturedModel() && this.props.modelType === "mesh"){
+            this.toggleTexturedModel({ target: { checked: true }});
           }
     
           let scene = viewer.scene;
@@ -272,7 +377,94 @@ class ModelView extends React.Component {
           material.size = 1;
 
           viewer.fitToScreen();
-        });     
+
+          if (getUnitSystem() === 'metric'){
+              viewer.setLengthUnitAndDisplayUnit('m', 'm');
+          }else{
+              viewer.setLengthUnitAndDisplayUnit('m', 'ft');
+          }
+
+          // Load saved scene (if any)
+          $.ajax({
+              type: "GET",
+              url: `/api/projects/${this.props.task.project}/tasks/${this.props.task.id}/3d/scene`
+          }).done(sceneData => {
+            let localSceneData = Potree.saveProject(viewer);
+
+            // Check if we do not have a view set
+            // if so, just keep the current view information
+            if (!sceneData.view || !sceneData.view.position){
+                sceneData.view = localSceneData.view;
+            }
+
+            const keepKeys = ['pointclouds', 'settings', 'cameraAnimations'];
+            for (let k of keepKeys){
+                sceneData[k] = localSceneData[k];
+            }
+            
+            for (let k in localSceneData){
+                if (keepKeys.indexOf(k) === -1){
+                    sceneData[k] = sceneData[k] || localSceneData[k];
+                }
+            }
+
+            // Load
+            const potreeLoadProject = () => {
+                Potree.loadProject(viewer, sceneData);
+                viewer.removeEventListener("update", potreeLoadProject);
+            };
+            viewer.addEventListener("update", potreeLoadProject);
+
+            // Every 3 seconds, check if the scene has changed
+            // if it has, save the changes server-side
+            // Unfortunately Potree does not have reliable events
+            // for trivially detecting changes in measurements
+            let saveSceneReq = null;
+            let saveSceneInterval = null;
+            let saveSceneErrors = 0;
+            let prevSceneData = JSON.stringify(this.getSceneData());
+            
+            const postSceneData = (sceneData) => {
+                if (saveSceneReq){
+                    saveSceneReq.abort();
+                    saveSceneReq = null;
+                }
+    
+                saveSceneReq = $.ajax({
+                    url: `/api/projects/${this.props.task.project}/tasks/${this.props.task.id}/3d/scene`,
+                    contentType: 'application/json',
+                    data: sceneData,
+                    dataType: 'json',
+                    type: 'POST'
+                    }).done(result => {
+                        if (result.success){
+                            saveSceneErrors = 0;
+                            prevSceneData = sceneData;
+                        }else{
+                            console.warn("Cannot save Potree scene");
+                        }
+                    }).fail(() => {
+                        console.error("Cannot save Potree scene");
+                        if (++saveSceneErrors === 5) clearInterval(saveSceneInterval);
+                    });
+            };
+
+            const checkScene = () => {
+                const sceneData = JSON.stringify(this.getSceneData());
+                if (sceneData !== prevSceneData) postSceneData(sceneData);
+                
+                // Potree is a bit strange, sometimes fitToScreen does
+                // not work, so we check whether the camera position is still
+                // at zero and recall fitToScreen
+                const pos = viewer.scene.view.position;
+                if (pos.x === 0 && pos.y === 0 && pos.z === 0) viewer.fitToScreen();
+            };
+
+            saveSceneInterval = setInterval(checkScene, 3000);
+          }).fail(e => {
+            console.error("Cannot load 3D scene information", e);
+          });
+        });
     });
 
     viewer.renderer.domElement.addEventListener( 'mousedown', this.handleRenderMouseClick );
@@ -304,13 +496,13 @@ class ModelView extends React.Component {
 
     if ( intersects.length > 0){
         const intersection = intersects[0];
-        return intersection.object;
+        return intersection.object.parent.parent;
     }
   }
 
   setCameraOpacity(camera, opacity){
-    camera.material.forEach(m => {
-        m.opacity = opacity;
+    camera.traverse(obj => {
+        if (obj.material) obj.material.opacity = opacity;
     });
   }
 
@@ -367,30 +559,34 @@ class ModelView extends React.Component {
     }
 
     if (this.hasCameras()){
-        const colladaLoader = new THREE.ColladaLoader();
         const fileloader = new THREE.FileLoader();
         
-        colladaLoader.load('/static/app/models/camera.dae', ( collada ) => {
-            const dae = collada.scene;
+        this.loadGltf('/static/app/models/camera.glb', (err, gltf) => {
+            if (err){
+                console.error(err);
+                return;
+            }
+
+            const cameraObj = gltf.scene;
 
             fileloader.load(`/api/projects/${task.project}/tasks/${task.id}/download/shots.geojson`,  ( data ) => {
                 const geojson = JSON.parse(data);
-                const cameraObj = dae.children[0];
-                cameraObj.material.forEach(m => {
-                    m.transparent = true; 
-                    m.opacity = 0.7;
+                cameraObj.traverse(obj => {
+                    if (obj.material){
+                        obj.material.transparent = true; 
+                        obj.material.opacity = 0.7;
+                    }
                 });
                 
-                // const cameraObj = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshNormalMaterial());
-
-                // TODO: instancing doesn't seem to work :/
-                // const cameraMeshes = new THREE.InstancedMesh( cameraObj.geometry, cameraObj.material, geojson.features.length );
-                // const dummy = new THREE.Object3D();
-
                 let i = 0;
                 geojson.features.forEach(feat => {
-                    const material = cameraObj.material.map(m => m.clone());
-                    const cameraMesh = new THREE.Mesh(cameraObj.geometry, material);
+                    const cameraMesh = cameraObj.clone();
+                    cameraMesh.traverse((node) => {
+                        if (node.isMesh) {
+                            node.material = node.material.clone();
+                        }
+                    });
+
                     cameraMesh.matrixAutoUpdate = false;
                     let scale = 1.0;
                     // if (!this.pointCloud.projection) scale = 0.1;
@@ -400,7 +596,7 @@ class ModelView extends React.Component {
                     viewer.scene.scene.add(cameraMesh);
 
                     cameraMesh._feat = feat;
-                    this.cameraMeshes.push(cameraMesh);
+                    this.cameraMeshes.push(cameraMesh.children[0].children[1]);
 
                     i++;
                 });
@@ -420,17 +616,38 @@ class ModelView extends React.Component {
     // }
   }
 
-  toggleCameras(e){
+  toggleCameras = (e) => {
     if (this.cameraMeshes.length === 0){
         this.loadCameras();
         if (this.cameraMeshes.length === 0) return;
     }
 
     const isVisible = this.cameraMeshes[0].visible;
-    this.cameraMeshes.forEach(cam => cam.visible = !isVisible);
+    this.cameraMeshes.forEach(cam => {
+        cam.visible = !isVisible;
+        cam.parent.visible = cam.visible;
+    });
   }
 
-  toggleTexturedModel(e){
+  loadGltf = (url, cb) => {
+    if (!this.gltfLoader) this.gltfLoader = new THREE.GLTFLoader();
+    if (!this.dracoLoader) {
+        this.dracoLoader = new THREE.DRACOLoader();
+        this.dracoLoader.setDecoderPath( '/static/app/js/vendor/draco/' );
+        this.gltfLoader.setDRACOLoader( this.dracoLoader );
+    }
+
+    // Load a glTF resource
+    this.gltfLoader.load(url,
+        gltf => { cb(null, gltf) },
+        xhr => {
+            // called while loading is progressing
+        },
+        error => { cb(error); }
+    );
+  }
+
+  toggleTexturedModel = (e) => {
     const value = e.target.checked;
 
     if (value){
@@ -439,49 +656,79 @@ class ModelView extends React.Component {
 
         this.setState({initializingModel: true});
 
-        const mtlLoader = new THREE.MTLLoader();
-        mtlLoader.setPath(this.texturedModelDirectoryPath());
+        const addObject = (object, offset) => {
+            object.translateX(offset.x);
+            object.translateY(offset.y);
 
-        this.mtlFilename(mtlPath => {
-            mtlLoader.load(mtlPath, (materials) => {
-                materials.preload();
+            viewer.scene.scene.add(object);
+
+            this.modelReference = object;
+            this.setPointCloudsVisible(false);
+
+            this.setState({
+                initializingModel: false,
+                showingTexturedModel: true
+            });
+        }
+
+        if (this.getTexturedModelType() === 'gltf'){
+            this.loadGltf(this.glbFilePath(), (err, gltf) => {
+                if (err){
+                    this.setState({initializingModel: false, error: err});
+                    return;
+                }
+
+                const offset = {x: 0, y: 0};
+                if (gltf.scene.CESIUM_RTC && gltf.scene.CESIUM_RTC.center){
+                    offset.x = gltf.scene.CESIUM_RTC.center[0];
+                    offset.y = gltf.scene.CESIUM_RTC.center[1];
+                }
+
+                addObject(gltf.scene, offset);
+            });
+        }else{
+            // Legacy OBJ
+
+            const mtlLoader = new THREE.MTLLoader();
+            mtlLoader.setPath(this.texturedModelDirectoryPath());
     
-                const objLoader = new THREE.OBJLoader();
-                objLoader.setMaterials(materials);
-                this.objFilePath(filePath => {
-                    objLoader.load(filePath, (object) => {
-                        this.loadGeoreferencingOffset((offset) => {
-                            object.translateX(offset.x);
-                            object.translateY(offset.y);
-            
-                            viewer.scene.scene.add(object);
-            
-                            this.modelReference = object;
-                            this.setPointCloudsVisible(false);
-            
-                            this.setState({
-                                initializingModel: false,
+            this.mtlFilename(mtlPath => {
+                mtlLoader.load(mtlPath, (materials) => {
+                    materials.preload();
+        
+                    const objLoader = new THREE.OBJLoader();
+                    objLoader.setMaterials(materials);
+                    this.objFilePath(filePath => {
+                        objLoader.load(filePath, (object) => {
+                            this.loadGeoreferencingOffset((offset) => {
+                                addObject(object, offset);
                             });
                         });
                     });
                 });
             });
-        });
+        }
       }else{
         // Already initialized
         this.modelReference.visible = true;
         this.setPointCloudsVisible(false);
+        this.setState({showingTexturedModel: true});
       }
     }else{
       this.modelReference.visible = false;
       this.setPointCloudsVisible(true);
+      this.setState({showingTexturedModel: false});
     }
   }
 
   // React render
   render(){
-    const { selectedCamera } = this.state;
+    const { selectedCamera, showingTexturedModel } = this.state;
     const { task } = this.props;
+    const queryParams = {};
+    if (showingTexturedModel){
+        queryParams.t = "mesh";
+    }
 
     return (<div className="model-view">
           <ErrorMessage bind={[this, "error"]} />
@@ -493,18 +740,21 @@ class ModelView extends React.Component {
                 <div id="potree_sidebar_container"> </div>
           </div>
 
-          <div className="model-action-buttons">
+          <div className={"model-action-buttons " + (this.state.modalOpen ? "modal-open" : "")}>
             <AssetDownloadButtons 
                             task={this.props.task} 
                             direction="up" 
                             showLabel={false}
-                            buttonClass="btn-secondary" />
-            {(!this.props.public) ? 
+                            buttonClass="btn-secondary"
+                            onModalOpen={() => this.setState({modalOpen: true})}
+                            onModalClose={() => this.setState({modalOpen: false})} />
+            {(this.props.shareButtons && !this.props.public) ? 
             <ShareButton 
                 ref={(ref) => { this.shareButton = ref; }}
                 task={this.props.task} 
                 popupPlacement="top"
                 linksTarget="3d"
+                queryParams={queryParams}
             />
             : ""}
             <SwitchModeButton 

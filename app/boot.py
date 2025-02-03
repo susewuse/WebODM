@@ -1,4 +1,5 @@
 import os
+import sys
 
 import kombu
 from django.contrib.auth.models import Permission
@@ -13,7 +14,7 @@ from app.models import Preset
 from app.models import Theme
 from app.plugins import init_plugins
 from nodeodm.models import ProcessingNode
-# noinspection PyUnresolvedReferences
+# noinspection PyUnresolvedReferencesapp/boot.py#L20
 from webodm.settings import MEDIA_ROOT
 from . import signals
 import logging
@@ -25,7 +26,7 @@ from webodm.wsgi import booted
 def boot():
     # booted is a shared memory variable to keep track of boot status
     # as multiple gunicorn workers could trigger the boot sequence twice
-    if (not settings.DEBUG and booted.value) or settings.MIGRATING: return
+    if (not settings.DEBUG and booted.value) or settings.MIGRATING or settings.FLUSHING: return
 
     booted.value = True
     logger = logging.getLogger('app.logger')
@@ -33,7 +34,11 @@ def boot():
     logger.info("Booting WebODM {}".format(settings.VERSION))
 
     if settings.DEBUG:
-       logger.warning("Debug mode is ON (for development this is OK)")
+        logger.warning("Debug mode is ON (for development this is OK)")
+
+    # Silence django's "Warning: Session data corrupted" messages
+    session_logger = logging.getLogger("django.SuspiciousOperation.SuspiciousSession")
+    session_logger.disabled = True
 
     # Make sure our app/media/tmp folder exists
     if not os.path.exists(settings.MEDIA_TMP):
@@ -82,7 +87,7 @@ def boot():
             s.app_logo.save(os.path.basename(settings.APP_DEFAULT_LOGO), File(open(settings.APP_DEFAULT_LOGO, 'rb')))
 
             logger.info("Created settings")
-
+        
         init_plugins()
 
         if not settings.TESTING:
@@ -99,41 +104,49 @@ def boot():
 def add_default_presets():
     try:
         Preset.objects.update_or_create(name='Multispectral', system=True,
-                                        defaults={'options': [{'name': 'texturing-skip-global-seam-leveling', 'value': True},
-                                                              {'name': 'radiometric-calibration', 'value': 'camera'},
-                                                              ]})
+                                        defaults={'options': [{'name': 'auto-boundary', 'value': True},
+                                                              {'name': 'radiometric-calibration', 'value': 'camera'}]})
         Preset.objects.update_or_create(name='Volume Analysis', system=True,
-                                        defaults={'options': [{'name': 'dsm', 'value': True},
+                                        defaults={'options': [{'name': 'auto-boundary', 'value': True},
+                                                              {'name': 'dsm', 'value': True},
                                                               {'name': 'dem-resolution', 'value': '2'},
                                                               {'name': 'pc-quality', 'value': 'high'}]})
         Preset.objects.update_or_create(name='3D Model', system=True,
-                                        defaults={'options': [{'name': 'mesh-octree-depth', 'value': "12"},
+                                        defaults={'options': [{'name': 'auto-boundary', 'value': True},
+                                                              {'name': 'mesh-octree-depth', 'value': "12"},
                                                               {'name': 'use-3dmesh', 'value': True},
                                                               {'name': 'pc-quality', 'value': 'high'},
                                                               {'name': 'mesh-size', 'value': '300000'}]})
         Preset.objects.update_or_create(name='Buildings', system=True,
-                                        defaults={'options': [{'name': 'mesh-size', 'value': '300000'},
+                                        defaults={'options': [{'name': 'auto-boundary', 'value': True},
+                                                              {'name': 'mesh-size', 'value': '300000'},
+                                                              {'name': 'feature-quality', 'value': 'high'},
                                                               {'name': 'pc-quality', 'value': 'high'}]})
-        Preset.objects.update_or_create(name='Point of Interest', system=True,
-                                        defaults={'options': [{'name': 'mesh-size', 'value': '300000'},
-                                                              {'name': 'use-3dmesh', 'value': True}]})
         Preset.objects.update_or_create(name='Forest', system=True,
-                                        defaults={'options': [{'name': 'min-num-features', 'value': '18000'},
-                                                              {'name': 'feature-quality', 'value': 'ultra'}]})
+                                        defaults={'options': [{'name': 'auto-boundary', 'value': True},
+                                                              {'name': 'min-num-features', 'value': '18000'},
+                                                              {'name': 'use-3dmesh', 'value': True},
+                                                              {'name': 'feature-quality', 'value': 'medium'}]})
         Preset.objects.update_or_create(name='DSM + DTM', system=True,
-                                        defaults={
-                                            'options': [{'name': 'dsm', 'value': True}, {'name': 'dtm', 'value': True}]})
+                                        defaults={'options': [{'name': 'auto-boundary', 'value': True},
+                                                              {'name': 'dsm', 'value': True},
+                                                              {'name': 'dtm', 'value': True}]})
+        Preset.objects.update_or_create(name='Field', system=True,
+                                        defaults={'options': [{'name': 'sfm-algorithm', 'value': 'planar'},
+                                                              {'name': 'fast-orthophoto', 'value': True},
+                                                              {'name': 'matcher-neighbors', 'value': 4}]})
         Preset.objects.update_or_create(name='Fast Orthophoto', system=True,
-                                        defaults={'options': [{'name': 'fast-orthophoto', 'value': True}]})
+                                        defaults={'options': [{'name': 'auto-boundary', 'value': True},
+                                                              {'name': 'fast-orthophoto', 'value': True}]})
         Preset.objects.update_or_create(name='High Resolution', system=True,
-                                        defaults={'options': [{'name': 'ignore-gsd', 'value': True},
+                                        defaults={'options': [{'name': 'auto-boundary', 'value': True},
                                                               {'name': 'dsm', 'value': True},
                                                               {'name': 'pc-quality', 'value': 'high'},
                                                               {'name': 'dem-resolution', 'value': "2.0"},
-                                                              {'name': 'orthophoto-resolution', 'value': "2.0"},
-                                                              ]})
+                                                              {'name': 'orthophoto-resolution', 'value': "2.0"}]})
         Preset.objects.update_or_create(name='Default', system=True,
-                                        defaults={'options': [{'name': 'dsm', 'value': True}]})
+                                        defaults={'options': [{'name': 'auto-boundary', 'value': True},
+                                                              {'name': 'dsm', 'value': True}]})
 
     except MultipleObjectsReturned:
         # Mostly to handle a legacy code problem where

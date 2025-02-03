@@ -9,24 +9,50 @@ from django.utils.translation import gettext_lazy as _
 algos = {
     'NDVI': {
         'expr': '(N - R) / (N + R)',
-        'help': _('Normalized Difference Vegetation Index shows the amount of green vegetation.')
+        'help': _('Normalized Difference Vegetation Index shows the amount of green vegetation.'),
+        'range': (-1, 1)
+    },
+    'NDYI': {
+        'expr': '(G - B) / (G + B)',
+        'help': _('Normalized difference yellowness index (NDYI), best model variability in relative yield potential in Canola.'),
+        'range': (-1, 1)
+    },
+    'NDRE': {
+        'expr': '(N - Re) / (N + Re)',
+        'help': _('Normalized Difference Red Edge Index shows the amount of green vegetation of permanent or later stage crops.'),
+        'range': (-1, 1)
+    },
+    'NDWI': {
+        'expr': '(G - N) / (G + N)',
+        'help': _('Normalized Difference Water Index shows the amount of water content in water bodies.'),
+        'range': (-1, 1)
     },
     'NDVI (Blue)': {
         'expr': '(N - B) / (N + B)',
-        'help': _('Normalized Difference Vegetation Index shows the amount of green vegetation.')
+        'help': _('Normalized Difference Vegetation Index shows the amount of green vegetation.'),
+        'range': (-1, 1)
     },
     'ENDVI':{
         'expr': '((N + G) - (2 * B)) / ((N + G) + (2 * B))',
         'help': _('Enhanced Normalized Difference Vegetation Index is like NDVI, but uses Blue and Green bands instead of only Red to isolate plant health.')
     },
+    'vNDVI':{
+        'expr': '0.5268*((R ** -0.1294) * (G ** 0.3389) * (B ** -0.3118))',
+        'help': _('Visible NDVI is an un-normalized index for RGB sensors using constants derived from citrus, grape, and sugarcane crop data.')
+    },    
     'VARI': {
         'expr': '(G - R) / (G + R - B)',
         'help': _('Visual Atmospheric Resistance Index shows the areas of vegetation.'),
         'range': (-1, 1)
+    },    
+    'MPRI': {
+        'expr': '(G - R) / (G + R)',
+        'help': _('Modified Photochemical Reflectance Index'),
+        'range': (-1, 1)
     },
     'EXG': {
         'expr': '(2 * G) - (R + B)',
-        'help': _('Excess Green Index emphasizes the greenness of leafy crops such as potatoes.',)
+        'help': _('Excess Green Index (derived from only the RGB bands) emphasizes the greenness of leafy crops such as potatoes.')
     },
     'BAI': {
         'expr': '1.0 / (((0.1 - R) ** 2) + ((0.06 - N) ** 2))',
@@ -39,7 +65,8 @@ algos = {
     },
     'GNDVI':{
         'expr': '(N - G) / (N + G)',
-        'help': _('Green Normalized Difference Vegetation Index is similar to NDVI, but measures the green spectrum instead of red.')
+        'help': _('Green Normalized Difference Vegetation Index is similar to NDVI, but measures the green spectrum instead of red.'),
+        'range': (-1, 1)
     },
     'GRVI':{
         'expr': 'N / G',
@@ -79,6 +106,19 @@ algos = {
         'help': _('Enhanced Vegetation Index is useful in areas where NDVI might saturate, by using blue wavelengths to correct soil signals.'),
         'range': (-1, 1)
     },
+    'ARVI': {
+        'expr': '(N - (2 * R) + B) / (N + (2 * R) + B)',
+        'help': _('Atmospherically Resistant Vegetation Index. Useful when working with imagery for regions with high atmospheric aerosol content.'),
+        'range': (-1, 1)
+    },
+    'Celsius': {
+        'expr': 'L',
+        'help': _('Temperature in Celsius degrees.')
+    },
+    'Kelvin': {
+        'expr': 'L * 100 + 27315',
+        'help': _('Temperature in Centikelvin degrees.')
+    },
 
     # more?
 
@@ -100,11 +140,21 @@ camera_filters = [
     'NRB',
 
     'RGBN',
+    'RGNRe',
+    'GRReN',
 
+    'RGBNRe',
     'BGRNRe',
     'BGRReN',
-    'RGBNRe',
     'RGBReN',
+
+    'RGBNReL',
+    'BGRNReL',
+    'BGRReNL',
+
+    'RGBNRePL',
+
+    'L', # FLIR camera has a single LWIR band
 
     # more?
     # TODO: certain cameras have only two bands? eg. MAPIR NDVI BLUE+NIR
@@ -119,9 +169,9 @@ def lookup_formula(algo, band_order = 'RGB'):
 
     if algo not in algos:
         raise ValueError("Cannot find algorithm " + algo)
-
-    input_bands = tuple(band_order)
-
+    
+    input_bands = tuple(b for b in re.split(r"([A-Z][a-z]*)", band_order) if b != "")
+    
     def repl(matches):
         b = matches.group(1)
         try:
@@ -136,11 +186,27 @@ def lookup_formula(algo, band_order = 'RGB'):
 
 @lru_cache(maxsize=2)
 def get_algorithm_list(max_bands=3):
-    return [{'id': k, 'filters': get_camera_filters_for(algos[k], max_bands), **algos[k]} for k in algos if not k.startswith("_")]
+    res = []
+    for k in algos:
+        if k.startswith("_"):
+            continue
+        
+        cam_filters = get_camera_filters_for(algos[k]['expr'], max_bands)
+        
+        if len(cam_filters) == 0:
+            continue
 
-def get_camera_filters_for(algo, max_bands=3):
+        res.append({
+            'id': k,
+            'filters': cam_filters,
+            **algos[k]
+        })
+
+    return res
+
+@lru_cache(maxsize=100)
+def get_camera_filters_for(expr, max_bands=3):
     result = []
-    expr = algo['expr']
     pattern = re.compile("([A-Z]+?[a-z]*)")
     bands = list(set(re.findall(pattern, expr)))
     for f in camera_filters:
@@ -158,3 +224,45 @@ def get_camera_filters_for(algo, max_bands=3):
 
     return result
 
+@lru_cache(maxsize=1)
+def get_bands_lookup():
+    bands_aliases = {
+        'R': ['red', 'r'],
+        'G': ['green', 'g'],
+        'B': ['blue', 'b'],
+        'N': ['nir', 'n'],
+        'Re': ['rededge', 're'],
+        'P': ['panchro', 'p'],
+        'L': ['lwir', 'l']
+    }
+    bands_lookup = {}
+    for band in bands_aliases:
+        for a in bands_aliases[band]:
+            bands_lookup[a] = band
+    return bands_lookup
+
+def get_auto_bands(orthophoto_bands, formula):
+    algo = algos.get(formula)
+    if not algo:
+        raise ValueError("Cannot find formula: " + formula)
+
+    max_bands = len(orthophoto_bands) - 1 # minus alpha
+    filters = get_camera_filters_for(algo['expr'], max_bands)
+    if not filters:
+        raise valueError(f"Cannot find filters for {algo} with max bands {max_bands}")
+
+    bands_lookup = get_bands_lookup()
+    band_order = ""
+
+    for band in orthophoto_bands:
+        if band['name'] == 'alpha' or (not band['description']):
+            continue
+        f_band = bands_lookup.get(band['description'].lower())
+
+        if f_band is not None:
+            band_order += f_band
+    
+    if band_order in filters:
+        return band_order, True
+    else:
+        return filters[0], False # Fallback

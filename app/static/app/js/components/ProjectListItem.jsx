@@ -7,11 +7,13 @@ import ImportTaskPanel from './ImportTaskPanel';
 import UploadProgressBar from './UploadProgressBar';
 import ErrorMessage from './ErrorMessage';
 import EditProjectDialog from './EditProjectDialog';
+import SortPanel from './SortPanel';
 import Dropzone from '../vendor/dropzone';
 import csrf from '../django/csrf';
 import HistoryNav from '../classes/HistoryNav';
 import PropTypes from 'prop-types';
 import ResizeModes from '../classes/ResizeModes';
+import Tags from '../classes/Tags';
 import exifr from '../vendor/exifr';
 import { _, interpolate } from '../classes/gettext';
 import $ from 'jquery';
@@ -20,7 +22,9 @@ class ProjectListItem extends React.Component {
   static propTypes = {
       history: PropTypes.object.isRequired,
       data: PropTypes.object.isRequired, // project json
-      onDelete: PropTypes.func
+      onDelete: PropTypes.func,
+      onTaskMoved: PropTypes.func,
+      onProjectDuplicated: PropTypes.func
   }
 
   constructor(props){
@@ -35,18 +39,35 @@ class ProjectListItem extends React.Component {
       data: props.data,
       refreshing: false,
       importing: false,
-      buttons: []
+      buttons: [],
+      sortKey: "-created_at",
+      filterTags: [],
+      selectedTags: [],
+      filterText: ""
     };
+
+    this.sortItems = [{
+        key: "created_at",
+        label: _("Created on")
+      },{
+        key: "name",
+        label: _("Name")
+      },{
+        key: "tags",
+        label: _("Tags")
+      }];
 
     this.toggleTaskList = this.toggleTaskList.bind(this);
     this.closeUploadError = this.closeUploadError.bind(this);
     this.cancelUpload = this.cancelUpload.bind(this);
+    this.handleCancel = this.handleCancel.bind(this);
     this.handleTaskSaved = this.handleTaskSaved.bind(this);
     this.viewMap = this.viewMap.bind(this);
     this.handleDelete = this.handleDelete.bind(this);
     this.handleEditProject = this.handleEditProject.bind(this);
     this.updateProject = this.updateProject.bind(this);
     this.taskDeleted = this.taskDeleted.bind(this);
+    this.taskMoved = this.taskMoved.bind(this);
     this.hasPermission = this.hasPermission.bind(this);
   }
 
@@ -70,6 +91,13 @@ class ProjectListItem extends React.Component {
   componentWillUnmount(){
     if (this.deleteProjectRequest) this.deleteProjectRequest.abort();
     if (this.refreshRequest) this.refreshRequest.abort();
+  }
+
+  componentDidUpdate(prevProps, prevState){
+    if (prevState.filterText !== this.state.filterText ||
+        prevState.selectedTags.length !== this.state.selectedTags.length){
+      if (this.taskList) this.taskList.applyFilter(this.state.filterText, this.state.selectedTags);
+    }
   }
 
   getDefaultUploadState(){
@@ -112,10 +140,11 @@ class ProjectListItem extends React.Component {
           url : 'TO_BE_CHANGED',
           parallelUploads: 6,
           uploadMultiple: false,
-          acceptedFiles: "image/*,text/*",
+          acceptedFiles: "image/*,text/plain,.las,.laz,video/*,.srt",
           autoProcessQueue: false,
           createImageThumbnails: false,
           clickable: this.uploadButton,
+          maxFilesize: 131072, // 128G
           chunkSize: 2147483647,
           timeout: 2147483647,
           
@@ -126,6 +155,35 @@ class ProjectListItem extends React.Component {
 
       this.dz.on("addedfiles", files => {
           let totalBytes = 0;
+
+          // Append a suffix to duplicate filenames
+          if (this.state.upload.files.length > 0){
+            const fileMap = {};
+            for (let i = 0; i < this.state.upload.files.length; i++){
+              const f = this.state.upload.files[i];
+              const filename = f.upload.filename;
+              if (!fileMap[filename]) fileMap[filename] = 1;
+              else fileMap[filename]++;
+            }
+            
+            for (let i = 0; i < files.length; i++){
+              const f = files[i];
+              const filename = f.upload.filename;
+
+              if (fileMap[filename] > 0){
+                const idx = filename.lastIndexOf(".");
+                if (idx !== -1){
+                  const name = filename.substring(0, idx);
+                  const ext = filename.substring(idx);
+                  f.upload.filename = `${name}_${fileMap[filename]}${ext}`;
+                  fileMap[filename]++;
+                }else{
+                  console.warn(`Duplicate ${filename} filename`);
+                }
+              }
+            }
+          }
+
           for (let i = 0; i < files.length; i++){
               totalBytes += files[i].size;
               files[i].deltaBytesSent = 0;
@@ -164,7 +222,7 @@ class ProjectListItem extends React.Component {
         .on("complete", (file) => {
             // Retry
             const retry = () => {
-                const MAX_RETRIES = 10;
+                const MAX_RETRIES = 20;
 
                 if (file.retries < MAX_RETRIES){
                     // Update progress
@@ -180,7 +238,9 @@ class ProjectListItem extends React.Component {
                     file.deltaBytesSent = 0;
                     file.trackedBytesSent = 0;
                     file.retries++;
-                    this.dz.processQueue();
+                    setTimeout(() => {
+                      this.dz.processQueue();
+                    }, 5000 * file.retries);
                 }else{
                     throw new Error(interpolate(_('Cannot upload %(filename)s, exceeded max retries (%(max_retries)s)'), {filename: file.name, max_retries: MAX_RETRIES}));
                 }
@@ -188,11 +248,19 @@ class ProjectListItem extends React.Component {
 
             try{
                 if (file.status === "error"){
+                    if ((file.size / 1024 / 1024) > this.dz.options.maxFilesize) {
+                        // Delete from upload queue
+                        this.setUploadState({
+                            totalCount: this.state.upload.totalCount - 1,
+                            totalBytes: this.state.upload.totalBytes - file.size
+                        });
+                        throw new Error(interpolate(_('Cannot upload %(filename)s, file is too large! Default MaxFileSize is %(maxFileSize)s MB!'), { filename: file.name, maxFileSize: this.dz.options.maxFilesize }));
+                    }
                     retry();
                 }else{
                     // Check response
                     let response = JSON.parse(file.xhr.response);
-                    if (response.success){
+                    if (response.success && response.uploaded && response.uploaded[file.upload.filename] === file.size){
                         // Update progress by removing the tracked progress and 
                         // use the file size as the true number of bytes
                         let totalBytesSent = this.state.upload.totalBytesSent + file.size;
@@ -212,13 +280,19 @@ class ProjectListItem extends React.Component {
                     }
                 }
             }catch(e){
-                this.setUploadState({error: `${e.message}`, uploading: false});
-                this.dz.cancelUpload();
+                if (this.manuallyCanceled){
+                  // Manually canceled, ignore error
+                  this.setUploadState({uploading: false});
+                }else{
+                  this.setUploadState({error: `${e.message}`, uploading: false});
+                }
+
+                if (this.dz.files.length) this.dz.cancelUpload();
             }
         })
         .on("queuecomplete", () => {
             const remainingFilesCount = this.state.upload.totalCount - this.state.upload.uploadedCount;
-            if (remainingFilesCount === 0){
+            if (remainingFilesCount === 0 && this.state.upload.uploadedCount > 0){
                 // All files have uploaded!
                 this.setUploadState({uploading: false});
 
@@ -239,7 +313,6 @@ class ProjectListItem extends React.Component {
             }else if (this.dz.getQueuedFiles() === 0){
                 // Done but didn't upload all?
                 this.setUploadState({
-                    totalCount: this.state.upload.totalCount - remainingFilesCount,
                     uploading: false,
                     error: interpolate(_('%(count)s files cannot be uploaded. As a reminder, only images (.jpg, .tif, .png) and GCP files (.txt) can be uploaded. Try again.'), { count: remainingFilesCount })
                 });
@@ -296,12 +369,33 @@ class ProjectListItem extends React.Component {
     this.setUploadState({error: ""});
   }
 
-  cancelUpload(e){
+  cancelUpload(){
     this.dz.removeAllFiles(true);
+  }
+
+  handleCancel(){
+    this.manuallyCanceled = true;
+    this.cancelUpload();
+    if (this.dz._taskInfo && this.dz._taskInfo.id !== undefined){
+      $.ajax({
+        url: `/api/projects/${this.state.data.id}/tasks/${this.dz._taskInfo.id}/remove/`,
+        contentType: 'application/json',
+        dataType: 'json',
+        type: 'POST'
+      });
+    }
+    setTimeout(() => {
+      this.manuallyCanceled = false;
+    }, 500);
   }
 
   taskDeleted(){
     this.refresh();
+  }
+
+  taskMoved(task){
+    this.refresh();
+    if (this.props.onTaskMoved) this.props.onTaskMoved(task);
   }
 
   handleDelete(){
@@ -368,16 +462,32 @@ class ProjectListItem extends React.Component {
     this.editProjectDialog.show();
   }
 
+  handleHideProject = (deleteWarning, deleteAction) => {
+    return () => {
+      if (window.confirm(deleteWarning)){
+        this.setState({error: "", refreshing: true});
+        deleteAction()
+          .fail(e => {
+            this.setState({error: e.message || (e.responseJSON || {}).detail || e.responseText || _("Could not delete item")});
+          }).always(() => {
+            this.setState({refreshing: false});
+          });
+      }
+    }
+  }
+
   updateProject(project){
     return $.ajax({
-        url: `/api/projects/${this.state.data.id}/`,
+        url: `/api/projects/${this.state.data.id}/edit/`,
         contentType: 'application/json',
         data: JSON.stringify({
           name: project.name,
           description: project.descr,
+          tags: project.tags,
+          permissions: project.permissions
         }),
         dataType: 'json',
-        type: 'PATCH'
+        type: 'POST'
       }).done(() => {
         this.refresh();
       });
@@ -395,7 +505,7 @@ class ProjectListItem extends React.Component {
     this.setState({importing: false});
   }
 
-  handleTaskTitleHint = () => {
+  handleTaskTitleHint = (hasGPSCallback) => {
       return new Promise((resolve, reject) => {
           if (this.state.upload.files.length > 0){
 
@@ -420,32 +530,27 @@ class ProjectListItem extends React.Component {
                 interop: false,
                 ifd1: false // thumbnail
               };
-              exifr.parse(f, options).then(gps => {
-                if (!gps.latitude || !gps.longitude){
+              exifr.parse(f, options).then(exif => {
+                if (!exif.latitude || !exif.longitude){
                     reject();
                     return;
                 }
 
-                let dateTime = gps["36867"];
+                if (hasGPSCallback !== undefined) hasGPSCallback();
 
-                // Try to parse the date from EXIF to JS
-                const parts = dateTime.split(" ");
-                if (parts.length == 2){
-                    let [ d, t ] = parts;
-                    d = d.replace(/:/g, "-");
-                    const tm = Date.parse(`${d} ${t}`);
-                    if (!isNaN(tm)){
-                        dateTime = new Date(tm).toLocaleDateString();
-                    }
-                }
+                let dateTime = exif.DateTimeOriginal;
+                if (dateTime && dateTime.toLocaleDateString) dateTime = dateTime.toLocaleDateString();
                 
                 // Fallback to file modified date if 
                 // no exif info is available
-                if (!dateTime) dateTime = f.lastModifiedDate.toLocaleDateString();
+                if (!dateTime){
+                  if (f.lastModifiedDate) dateTime = f.lastModifiedDate.toLocaleDateString();
+                  else if (f.lastModified) dateTime = new Date(f.lastModified).toLocaleDateString();
+                }
 
                 // Query nominatim OSM
                 $.ajax({
-                    url: `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${gps.latitude}&lon=${gps.longitude}`,
+                    url: `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${exif.latitude}&lon=${exif.longitude}`,
                     contentType: 'application/json',
                     type: 'GET'
                 }).done(json => {
@@ -458,31 +563,98 @@ class ProjectListItem extends React.Component {
       });
   }
 
+  sortChanged = key => {
+    if (this.taskList){
+      this.setState({sortKey: key});
+      setTimeout(() => {
+        this.taskList.refresh();
+      }, 0);
+    }
+  }
+
+  handleTagClick = tag => {
+    return e => {
+      const evt = new CustomEvent("onProjectListTagClicked", { detail: tag });
+      document.dispatchEvent(evt);
+    }
+  }
+
+  tagsChanged = (filterTags) => {
+    this.setState({filterTags, selectedTags: []});
+  }
+
+  handleFilterTextChange = e => {
+    this.setState({filterText: e.target.value});
+  }
+
+  toggleTag = t => {
+    return () => {
+      if (this.state.selectedTags.indexOf(t) === -1){
+        this.setState(update(this.state, { selectedTags: {$push: [t]} }));
+      }else{
+        this.setState({selectedTags: this.state.selectedTags.filter(tag => tag !== t)});
+      }
+    }
+  }
+
+  selectTag = t => {
+    if (this.state.selectedTags.indexOf(t) === -1){
+      this.setState(update(this.state, { selectedTags: {$push: [t]} }));
+    }
+  }
+
+  clearFilter = () => {
+    this.setState({
+      filterText: "",
+      selectedTags: []
+    });
+  }
+
+  onOpenFilter = () => {
+    if (this.state.filterTags.length === 0){
+      setTimeout(() => {
+        this.filterTextInput.focus();
+      }, 0);
+    }
+  }
+
   render() {
-    const { refreshing, data } = this.state;
+    const { refreshing, data, filterTags } = this.state;
     const numTasks = data.tasks.length;
+    const canEdit = this.hasPermission("change");
+    const userTags = Tags.userTags(data.tags);
+    let deleteWarning = _("All tasks, images and models associated with this project will be permanently deleted. Are you sure you want to continue?");
+    if (!data.owned) deleteWarning = _("This project was shared with you. It will not be deleted, but simply hidden from your dashboard. Continue?")
 
     return (
       <li className={"project-list-item list-group-item " + (refreshing ? "refreshing" : "")}
          href="javascript:void(0);"
          ref={this.setRef("dropzone")}
          >
-
-        <EditProjectDialog 
-          ref={(domNode) => { this.editProjectDialog = domNode; }}
-          title={_("Edit Project")}
-          saveLabel={_("Save Changes")}
-          savingLabel={_("Saving changes...")}
-          saveIcon="far fa-edit"
-          projectName={data.name}
-          projectDescr={data.description}
-          saveAction={this.updateProject}
-          deleteAction={this.hasPermission("delete") ? this.handleDelete : undefined}
-        />
+        
+        {canEdit ? 
+            <EditProjectDialog 
+            ref={(domNode) => { this.editProjectDialog = domNode; }}
+            title={_("Edit Project")}
+            saveLabel={_("Save Changes")}
+            savingLabel={_("Saving changes...")}
+            saveIcon="far fa-edit"
+            showDuplicate={true}
+            onDuplicated={this.props.onProjectDuplicated}
+            projectName={data.name}
+            projectDescr={data.description}
+            projectId={data.id}
+            projectTags={data.tags}
+            deleteWarning={deleteWarning}
+            saveAction={this.updateProject}
+            showPermissions={this.hasPermission("change")}
+            deleteAction={this.hasPermission("delete") ? this.handleDelete : undefined}
+            />
+        : ""}
 
         <div className="row no-margin">
           <ErrorMessage bind={[this, 'error']} />
-          <div className="btn-group pull-right">
+          <div className="btn-group project-buttons">
             {this.hasPermission("add") ? 
               <div className={"asset-download-buttons btn-group " + (this.state.upload.uploading ? "hide" : "")}>
                 <button type="button" 
@@ -490,12 +662,12 @@ class ProjectListItem extends React.Component {
                       onClick={this.handleUpload}
                       ref={this.setRef("uploadButton")}>
                   <i className="glyphicon glyphicon-upload"></i>
-                  {_("Select Images and GCP")}
+                  <span className="hidden-xs">{_("Select Images and GCP")}</span>
                 </button>
                 <button type="button" 
                       className="btn btn-default btn-sm"
                       onClick={this.handleImportTask}>
-                  <i className="glyphicon glyphicon-import"></i> {_("Import")}
+                  <i className="glyphicon glyphicon-import"></i> <span className="hidden-xs">{_("Import")}</span>
                 </button>
                 {this.state.buttons.map((button, i) => <React.Fragment key={i}>{button}</React.Fragment>)}
               </div>
@@ -504,35 +676,90 @@ class ProjectListItem extends React.Component {
             <button disabled={this.state.upload.error !== ""} 
                     type="button"
                     className={"btn btn-danger btn-sm " + (!this.state.upload.uploading ? "hide" : "")} 
-                    onClick={this.cancelUpload}>
+                    onClick={this.handleCancel}>
               <i className="glyphicon glyphicon-remove-circle"></i>
               Cancel Upload
             </button> 
-
-            <button type="button" className="btn btn-default btn-sm" onClick={this.viewMap}>
-              <i className="fa fa-globe"></i> {_("View Map")}
-            </button>
           </div>
 
-          <span className="project-name">
+          <div className="project-name">
             {data.name}
-          </span>
+            {userTags.length > 0 ? 
+              userTags.map((t, i) => <div key={i} className="tag-badge small-badge" onClick={this.handleTagClick(t)}>{t}</div>)
+              : ""}
+          </div>
           <div className="project-description">
             {data.description}
           </div>
           <div className="row project-links">
             {numTasks > 0 ? 
               <span>
-                <i className='fa fa-tasks'>
-                </i> <a href="javascript:void(0);" onClick={this.toggleTaskList}>
+                <i className='fa fa-tasks'></i>
+                <a href="javascript:void(0);" onClick={this.toggleTaskList}>
                   {interpolate(_("%(count)s Tasks"), { count: numTasks})} <i className={'fa fa-caret-' + (this.state.showTaskList ? 'down' : 'right')}></i>
                 </a>
               </span>
               : ""}
+            
+            {this.state.showTaskList && numTasks > 1 ? 
+              <div className="task-filters">
+                <div className="btn-group">
+                  {this.state.selectedTags.length || this.state.filterText !== "" ? 
+                    <a className="quick-clear-filter" href="javascript:void(0)" onClick={this.clearFilter}>×</a>
+                  : ""}
+                  <i className='fa fa-filter'></i>
+                  <a href="javascript:void(0);" onClick={this.onOpenFilter} className="dropdown-toggle" data-toggle-outside data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+                    {_("Filter")}
+                  </a>
+                  <ul className="dropdown-menu dropdown-menu-right filter-dropdown">
+                  <li className="filter-text-container">
+                    <input type="text" className="form-control filter-text theme-border-secondary-07" 
+                          value={this.state.filterText}
+                          ref={domNode => {this.filterTextInput = domNode}}
+                          placeholder=""
+                          spellCheck="false"
+                          autoComplete="false"
+                          onChange={this.handleFilterTextChange} />
+                  </li>
+                  {filterTags.map(t => <li key={t} className="tag-selection">
+                    <input type="checkbox"
+                        className="filter-checkbox"
+                        id={"filter-tag-" + data.id + "-" + t}
+                        checked={this.state.selectedTags.indexOf(t) !== -1}
+                        onChange={this.toggleTag(t)} /> <label className="filter-checkbox-label" htmlFor={"filter-tag-" + data.id + "-" + t}>{t}</label>
+                  </li>)}
 
-            <i className='far fa-edit'>
-            </i> <a href="javascript:void(0);" onClick={this.handleEditProject}> {_("Edit")}
-            </a>
+                  <li className="clear-container"><input type="button" onClick={this.clearFilter} className="btn btn-default btn-xs" value={_("Clear")}/></li>
+                  </ul>
+                </div>
+                <div className="btn-group">
+                  <i className='fa fa-sort-alpha-down'></i>
+                  <a href="javascript:void(0);" className="dropdown-toggle" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+                    {_("Sort")}
+                  </a>
+                  <SortPanel selected="-created_at" items={this.sortItems} onChange={this.sortChanged} />
+                </div>
+              </div> : ""}
+
+              {numTasks > 0 ? 
+                [<i key="edit-icon" className='fa fa-globe'></i>
+                ,<a key="edit-text" href="javascript:void(0);" onClick={this.viewMap}>
+                  {_("View Map")}
+                </a>]
+              : ""}
+              
+            {canEdit ? 
+                [<i key="edit-icon" className='far fa-edit'></i>
+                ,<a key="edit-text" href="javascript:void(0);" onClick={this.handleEditProject}> {_("Edit")}
+                </a>]
+            : ""}
+
+            {!canEdit && !data.owned ? 
+              [<i key="edit-icon" className='far fa-eye-slash'></i>
+              ,<a key="edit-text" href="javascript:void(0);" onClick={this.handleHideProject(deleteWarning, this.handleDelete)}> {_("Delete")}
+              </a>]
+            : ""}
+
           </div>
         </div>
         <i className="drag-drop-icon fa fa-inbox"></i>
@@ -568,8 +795,12 @@ class ProjectListItem extends React.Component {
           {this.state.showTaskList ? 
             <TaskList 
                 ref={this.setRef("taskList")} 
-                source={`/api/projects/${data.id}/tasks/?ordering=-created_at`}
+                source={`/api/projects/${data.id}/tasks/?ordering=${this.state.sortKey}`}
                 onDelete={this.taskDeleted}
+                onTaskMoved={this.taskMoved}
+                hasPermission={this.hasPermission}
+                onTagsChanged={this.tagsChanged}
+                onTagClicked={this.selectTag}
                 history={this.props.history}
             /> : ""}
 

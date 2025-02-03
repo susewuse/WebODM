@@ -3,7 +3,7 @@
   background: #fff;
   width: 300px;
   min-height: 74px;
-  max-height: 400px;
+  max-height: 418px;
   overflow-y: auto;
 
   .loading{
@@ -44,5 +44,13 @@
 
   *{
       font-size: 12px;
+  }
+
+  .layer-group-title{
+    margin-top: 2px;
+    margin-bottom: 2px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    overflow: hidden;
   }
 }

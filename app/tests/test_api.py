@@ -1,4 +1,5 @@
 import datetime
+import os
 
 from django.contrib.auth.models import User
 from guardian.shortcuts import assign_perm, get_objects_for_user
@@ -12,8 +13,9 @@ from app.models import Project, Task
 from app.plugins.signals import processing_node_removed
 from app.tests.utils import catch_signal
 from nodeodm import status_codes
-from nodeodm.models import ProcessingNode, OFFLINE_MINUTES
+from nodeodm.models import ProcessingNode
 from .classes import BootTestCase
+from webodm import settings
 
 
 class TestApi(BootTestCase):
@@ -47,10 +49,14 @@ class TestApi(BootTestCase):
         client.login(username="testuser", password="test1234")
         res = client.get('/api/projects/')
         self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertTrue(len(res.data["results"]) > 0)
+        self.assertTrue(len(res.data) > 0)
+
+        res = client.get('/api/projects/?page=1')
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(len(res.data['results']) > 0)
 
         # Can sort
-        res = client.get('/api/projects/?ordering=-created_at')
+        res = client.get('/api/projects/?ordering=-created_at&page=1')
         last_project = Project.objects.filter(owner=user).latest('created_at')
         self.assertTrue(res.data["results"][0]['id'] == last_project.id)
 
@@ -64,12 +70,12 @@ class TestApi(BootTestCase):
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
 
         # Can filter
-        res = client.get('/api/projects/?name=999')
+        res = client.get('/api/projects/?name=999&page=1')
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         self.assertTrue(len(res.data["results"]) == 0)
 
         # Cannot list somebody else's project without permission
-        res = client.get('/api/projects/?id={}'.format(other_project.id))
+        res = client.get('/api/projects/?id={}&page=1'.format(other_project.id))
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         self.assertTrue(len(res.data["results"]) == 0)
 
@@ -135,22 +141,26 @@ class TestApi(BootTestCase):
         self.assertEqual(res.status_code, status.HTTP_200_OK)
         self.assertTrue(res.data == "")
 
-        task.console_output = "line1\nline2\nline3"
+        data_path = task.data_path()
+        if not os.path.exists(data_path):
+            os.makedirs(data_path, exist_ok=True)
+
+        task.console.reset("line1\nline2\nline3")
         task.save()
 
         res = client.get('/api/projects/{}/tasks/{}/output/'.format(project.id, task.id))
         self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertTrue(res.data == task.console_output)
+        self.assertEqual(res.data, task.console.output())
 
         # Console output with line num
         res = client.get('/api/projects/{}/tasks/{}/output/?line=2'.format(project.id, task.id))
-        self.assertTrue(res.data == "line3")
+        self.assertEqual(res.data, "line3")
 
         # Console output with line num out of bounds
         res = client.get('/api/projects/{}/tasks/{}/output/?line=3'.format(project.id, task.id))
-        self.assertTrue(res.data == "")
+        self.assertEqual(res.data, "")
         res = client.get('/api/projects/{}/tasks/{}/output/?line=-1'.format(project.id, task.id))
-        self.assertTrue(res.data == task.console_output)
+        self.assertEqual(res.data, task.console.output())
 
         # Cannot list task details for a task belonging to a project we don't have access to
         res = client.get('/api/projects/{}/tasks/{}/'.format(other_project.id, other_task.id))
@@ -159,6 +169,21 @@ class TestApi(BootTestCase):
         # As above, but by trying to trick the API by using a project we have access to
         res = client.get('/api/projects/{}/tasks/{}/'.format(project.id, other_task.id))
         self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+        # Cannot duplicate a project we have no access to
+        res = client.post('/api/projects/{}/duplicate/'.format(other_project.id))
+        self.assertEqual(res.status_code, status.HTTP_404_NOT_FOUND)
+
+        # Can duplicate a project we have access to
+        res = client.post('/api/projects/{}/duplicate/'.format(project.id))
+        self.assertEqual(res.status_code, status.HTTP_200_OK)
+        self.assertTrue(res.data.get('success'))
+        new_project_id = res.data['project']['id']
+        self.assertNotEqual(new_project_id, project.id)
+
+        # Tasks have been duplicated
+        duplicated_project = Project.objects.get(pk=new_project_id)
+        self.assertEqual(project.task_set.count(), duplicated_project.task_set.count())
 
         # Cannot access task details for a task that doesn't exist
         res = client.get('/api/projects/{}/tasks/4004d1e9-ed2c-4983-8b93-fc7577ee6d89/'.format(project.id))
@@ -233,14 +258,17 @@ class TestApi(BootTestCase):
         for perm in ['delete', 'change', 'add']:
             self.assertFalse(perm in res.data['permissions'])
 
-        # Can't delete a project for which we just have view permissions
-        res = client.delete('/api/projects/{}/'.format(other_temp_project.id))
-        self.assertTrue(res.status_code == status.HTTP_403_FORBIDDEN)
-
-        # Can delete a project for which we have delete permissions
-        assign_perm('delete_project', user, other_temp_project)
+        # Can delete a project for which we just have view permissions
+        # (we will just remove our read permissions without deleting the project)
         res = client.delete('/api/projects/{}/'.format(other_temp_project.id))
         self.assertTrue(res.status_code == status.HTTP_204_NO_CONTENT)
+        
+        # Project still exists
+        self.assertTrue(Project.objects.filter(id=other_temp_project.id).count() == 1)
+
+        # We just can't access it
+        res = client.get('/api/projects/{}/'.format(other_temp_project.id))
+        self.assertTrue(res.status_code == status.HTTP_404_NOT_FOUND)
 
         # A user cannot reassign a task to a
         # project for which he/she has no permissions
@@ -416,7 +444,7 @@ class TestApi(BootTestCase):
                                            last_refreshed=timezone.now(),
                                            available_options=[{'name': 'd'}])
         p4 = ProcessingNode.objects.create(hostname="invalid-host-4", port=11223,
-                                           last_refreshed=timezone.now() - datetime.timedelta(minutes=OFFLINE_MINUTES * 2),
+                                           last_refreshed=timezone.now() - datetime.timedelta(minutes=settings.NODE_OFFLINE_MINUTES * 2),
                                            available_options=[{'name': 'd'}]) # offline
 
         assign_perm('view_processingnode', user, p1)
@@ -432,6 +460,18 @@ class TestApi(BootTestCase):
         self.assertTrue(len(res.data) == 1)
         self.assertTrue(res.data[0]['name'] == 'a')
 
+        # Test optimistic mode
+        self.assertFalse(p4.is_online())
+
+        settings.NODE_OPTIMISTIC_MODE = True
+
+        self.assertTrue(p4.is_online())
+        res = client.get('/api/processingnodes/')
+        self.assertEqual(len(res.data), 3)
+        for nodes in res.data:
+            self.assertTrue(nodes['online'])
+
+        settings.NODE_OPTIMISTIC_MODE = False
 
     def test_token_auth(self):
         client = APIClient()

@@ -74,6 +74,7 @@ target/
 .python-version
 
 # celery beat schedule file
+celerybeat-schedule.db
 celerybeat-schedule
 celerybeat.pid
 
@@ -98,3 +99,8 @@ package-lock.json
 .cronenv
 .initialized
 .DS_Store
+
+# Debian builds
+dpkg/build
+dpkg/deb
+.secret_key

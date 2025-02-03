@@ -12,6 +12,12 @@
     	button{
     		margin-top: 10px;
     	}
+
+        &.alert-images{
+            button{
+                margin-top: 0;
+            }
+        }
     }
 
     p.header{
@@ -40,5 +46,10 @@
     .disabled{
         opacity: 0.8;
         pointer-events:none;
+    }
+
+    button.redo{
+        margin-top: 0;
+        margin-left: 10px;
     }
 }

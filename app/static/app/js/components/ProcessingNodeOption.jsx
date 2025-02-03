@@ -4,6 +4,10 @@ import PropTypes from 'prop-types';
 import $ from 'jquery';
 import { _ } from '../classes/gettext';
 
+const warnings = {
+    'ignore-gsd': _("You might run out of memory if you use this option.")
+};
+
 class ProcessingNodeOption extends React.Component {
   static defaultProps = {};
 
@@ -102,8 +106,17 @@ class ProcessingNodeOption extends React.Component {
     }
   }
 
+  handleHelp = e => {
+    e.preventDefault();
+    if (window.__taskOptionsDocsLink){
+      window.open(window.__taskOptionsDocsLink + "#" + encodeURIComponent(this.props.name), "task-options")
+    }
+  }
+
   render() {
     let inputControl = "";
+    let warningMsg = "";
+
     if (this.props.type !== 'bool'){
       if (this.isEnumType()){
         // Enum
@@ -146,23 +159,31 @@ class ProcessingNodeOption extends React.Component {
     let loadFileControl = "";
     if (this.supportsFileAPI() && this.props.domain === 'json'){
         loadFileControl = ([
-            <button key="btn" type="file" className="btn glyphicon glyphicon-import btn-primary" data-toggle="tooltip" data-placement="left" title={_("Click to import a .JSON file")} onClick={() => this.loadFile()}></button>,
+            <button key="btn" type="file" className="btn glyphicon glyphicon-import btn-primary" data-toggle="tooltip" data-placement="left" title={_("Click to import a JSON file")} onClick={() => this.loadFile()}></button>,
             <input key="file-ctrl" className="file-control" type="file" 
-                accept="text/*,application/json"
+                accept="text/plain,application/json,application/geo+json,.geojson"
                 onChange={this.handleFileSelect}
                 ref={(domNode) => { this.fileControl = domNode}} />
         ]);
     }
 
+    if (warnings[this.props.name] !== undefined && this.state.value !== ""){
+        warningMsg = (<div class="alert alert-warning">
+                <i class="fa fa-exclamation-triangle"></i> {warnings[this.props.name]}
+            </div>);
+    }
+
     return (
       <div className="processing-node-option form-inline form-group form-horizontal" ref={this.setTooltips}>
-        <label>{this.props.name} {(!this.isEnumType() && this.props.domain ? `(${this.props.domain})` : "")} <i data-toggle="tooltip" data-placement="bottom" title={this.props.help} onClick={e => e.preventDefault()} className="fa fa-info-circle info-button"></i></label><br/>
+        <label>{this.props.name} {(!this.isEnumType() && this.props.domain ? `(${this.props.domain})` : "")} <i data-toggle="tooltip" data-placement="bottom" title={this.props.help} onClick={this.handleHelp} className="fa fa-info-circle info-button help-button"></i></label><br/>
         {inputControl}
         {loadFileControl}
         
         {this.state.value !== "" ? 
         <button type="submit" className="btn glyphicon glyphicon glyphicon-repeat btn-default" data-toggle="tooltip" data-placement="top" title={_("Reset to default")} onClick={this.resetToDefault}></button> :
         ""}
+
+        {warningMsg}
       </div>
     );
   }

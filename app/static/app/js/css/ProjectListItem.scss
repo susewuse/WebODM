@@ -5,6 +5,10 @@
         font-weight: bold;
     }
 
+    .project-description{
+        min-height: 12px;
+    }
+
     .drag-drop-icon{
         display: none;
         position: absolute;
@@ -47,6 +51,8 @@
     }
 
     .project-links{
+        margin-top: 10px;
+        margin-bottom: 10px;
         font-size: 90%;
         i{
             margin-right: 4px;
@@ -54,6 +60,11 @@
         a{
             margin-right: 12px;
         }
+    }
+
+    .btn-danger .fa-trash{
+        margin-right: 2px;
+        margin-left: 0px;
     }
     
     .dz-preview{
@@ -63,6 +74,81 @@
     .row{
         margin-left: 0;
         margin-right: 0;
-        margin-top: 10px;
+    }
+
+    .project-buttons {
+        float: right;
+    }
+
+    .task-filters{
+        float: right;
+    }
+
+    .tag-badge.small-badge {
+        display: inline-block;
+        width: auto;
+        padding-left: 6px;
+        padding-right: 6px;
+        padding-top: 0px;
+        padding-bottom: 0px;
+        margin-left: 4px;
+        margin-top: -2px;
+        border-radius: 6px;
+        font-size: 90%;
+        position: relative;
+        top: -1px;
+        &:hover{
+            cursor: pointer;
+        }
+    }
+
+    .filter-dropdown{
+        max-width: 320px;
+        padding-bottom: 6px;
+    }
+
+    .filter-text{
+        height: 25px;
+        margin-left: 7px;
+        margin-right: 6px;
+        margin-bottom: 4px;
+        padding-left: 4px;
+        padding-right: 4px;
+        border-width: 1px;
+        border-radius: 3px;
+        display: block;
+        width: 100%;
+    }
+
+    .filter-text-container,.tag-selection{
+        display: flex;
+    }
+
+    .filter-checkbox{
+        margin-left: 8px;
+    }
+    .filter-checkbox-label{
+        font-weight: normal;
+        position: relative;
+        top: 4px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        margin-left: 4px;
+        width: 100%;
+    }
+
+    .clear-container{
+        text-align: right;
+        margin-top: 2px;
+        margin-right: 6px;
+    }
+
+    .quick-clear-filter{
+        margin-right: 6px !important;
+    }
+
+    .asset-download-buttons > button:last-child{
+        border-top-right-radius: 3px !important;
+        border-bottom-right-radius: 3px !important;
     }
 }

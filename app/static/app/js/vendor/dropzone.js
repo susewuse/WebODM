@@ -1556,6 +1556,22 @@ var Dropzone = function (_Emitter) {
       });
     }
   }, {
+    key: "removeListeners",
+    value: function disable() {
+      this.clickableElements.forEach(function (element) {
+        return element.classList.remove("dz-clickable");
+      });
+      this.removeEventListeners();
+    }
+  }, {
+    key: "restoreListeners",
+    value: function disable() {
+      this.clickableElements.forEach(function (element) {
+        return element.classList.add("dz-clickable");
+      });
+      return this.setupEventListeners();
+    }
+  }, {
     key: "enable",
     value: function enable() {
       this.clickableElements.forEach(function (element) {
@@ -2183,6 +2199,8 @@ var Dropzone = function (_Emitter) {
   }, {
     key: "cancelUpload",
     value: function cancelUpload(file) {
+      if (file === undefined) return;
+
       if (file.status === Dropzone.UPLOADING) {
         var groupedFiles = this._getFilesWithXhr(file.xhr);
         for (var _iterator19 = groupedFiles, _isArray19 = true, _i20 = 0, _iterator19 = _isArray19 ? _iterator19 : _iterator19[Symbol.iterator]();;) {

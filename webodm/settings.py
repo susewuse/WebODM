@@ -27,18 +27,21 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 try:
     from .secret_key import SECRET_KEY
 except ImportError:
-    # This will be executed the first time Django runs
-    # It generates a secret_key.py file that contains the SECRET_KEY
-    from django.utils.crypto import get_random_string
+    if os.environ.get("WO_SECRET_KEY", "") != "":
+        SECRET_KEY = os.environ.get("WO_SECRET_KEY")
+    else:
+        # This will be executed the first time Django runs
+        # It generates a secret_key.py file that contains the SECRET_KEY
+        from django.utils.crypto import get_random_string
 
-    current_dir = os.path.abspath(os.path.dirname(__file__))
-    chars = 'abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*(-_=+)'
-    secret = get_random_string(50, chars)
-    with open(os.path.join(current_dir, 'secret_key.py'), 'w') as f:
-        f.write("SECRET_KEY='{}'".format(secret))
-    SECRET_KEY=secret
+        current_dir = os.path.abspath(os.path.dirname(__file__))
+        chars = 'abcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*(-_=+)'
+        secret = get_random_string(50, chars)
+        with open(os.path.join(current_dir, 'secret_key.py'), 'w') as f:
+            f.write("SECRET_KEY='{}'".format(secret))
+        SECRET_KEY=secret
 
-    print("Generated secret key")
+        print("Generated secret key")
 
 with open(os.path.join(BASE_DIR, 'package.json')) as package_file:
     data = json.load(package_file)
@@ -51,7 +54,8 @@ WORKER_RUNNING = sys.argv[2:3] == ["worker"]
 
 # SECURITY WARNING: don't run with debug turned on a public facing server!
 DEBUG = os.environ.get('WO_DEBUG', 'YES') == 'YES' or TESTING
-DEV = os.environ.get('WO_DEV', 'NO') == 'YES'
+DEV = os.environ.get('WO_DEV', 'NO') == 'YES' and not TESTING
+DEV_WATCH_PLUGINS = DEV and os.environ.get('WO_DEV_WATCH_PLUGINS', 'NO') == 'YES'
 SESSION_COOKIE_SECURE = CSRF_COOKIE_SECURE = os.environ.get('WO_SSL', 'NO') == 'YES'
 INTERNAL_IPS = ['127.0.0.1']
 
@@ -67,6 +71,17 @@ SINGLE_USER_MODE = False
 
 # URL to redirect to if there are no processing nodes when visiting the dashboard
 PROCESSING_NODES_ONBOARDING = None
+
+# Enable the /api/users endpoint which is used for autocompleting
+# usernames when handling project permissions. This can be disabled
+# for security reasons if you don't want to let authenticated users
+# retrieve the user list. 
+ENABLE_USERS_API = True
+
+# Enable desktop mode. In desktop mode some styling changes
+# are applied to make the application look nicer on desktop
+# as well as disabling certain features (e.g. sharing)
+DESKTOP_MODE = False
 
 # Default CSS to add to theme
 DEFAULT_THEME_CSS = ''
@@ -93,12 +108,12 @@ INSTALLED_APPS = [
     'guardian',
     'rest_framework',
     'rest_framework_nested',
+    'drf_yasg',
     'webpack_loader',
     'corsheaders',
     'colorfield',
     'imagekit',
     'codemirror2',
-    'compressor',
     'app',
     'nodeodm',
 ]
@@ -115,27 +130,6 @@ MIDDLEWARE = [
 ]
 
 ROOT_URLCONF = 'webodm.urls'
-
-TEMPLATES = [
-    {
-        'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [
-            os.path.join(BASE_DIR, 'app', 'templates'),
-            os.path.join(BASE_DIR, 'app', 'templates', 'app'),
-            BASE_DIR
-        ],
-        'APP_DIRS': True,
-        'OPTIONS': {
-            'context_processors': [
-                'django.template.context_processors.debug',
-                'django.template.context_processors.request',
-                'django.contrib.auth.context_processors.auth',
-                'django.contrib.messages.context_processors.messages',
-                'app.contexts.settings.load',
-            ],
-        },
-    },
-]
 
 WSGI_APPLICATION = 'webodm.wsgi.application'
 
@@ -177,6 +171,7 @@ AUTH_PASSWORD_VALIDATORS = [
 AUTHENTICATION_BACKENDS = (
     'django.contrib.auth.backends.ModelBackend', # this is default
     'guardian.backends.ObjectPermissionBackend',
+    'app.auth.backends.ExternalBackend',
 )
 
 # Internationalization
@@ -203,7 +198,6 @@ STATICFILES_DIRS = [
 STATICFILES_FINDERS = [
     'django.contrib.staticfiles.finders.FileSystemFinder',
     'django.contrib.staticfiles.finders.AppDirectoriesFinder',
-    'compressor.finders.CompressorFinder',
 ]
 
 # File Uploads
@@ -285,6 +279,28 @@ MEDIA_TMP = os.path.join(MEDIA_ROOT, 'tmp')
 
 FILE_UPLOAD_TEMP_DIR = MEDIA_TMP
 
+TEMPLATES = [
+    {
+        'BACKEND': 'django.template.backends.django.DjangoTemplates',
+        'DIRS': [
+            os.path.join(BASE_DIR, 'app', 'templates'),
+            os.path.join(BASE_DIR, 'app', 'templates', 'app'),
+            BASE_DIR,
+            MEDIA_ROOT,
+        ],
+        'APP_DIRS': True,
+        'OPTIONS': {
+            'context_processors': [
+                'django.template.context_processors.debug',
+                'django.template.context_processors.request',
+                'django.contrib.auth.context_processors.auth',
+                'django.contrib.messages.context_processors.messages',
+                'app.contexts.settings.load',
+            ],
+        },
+    },
+]
+
 # Store flash messages in cookies
 MESSAGE_STORAGE = 'django.contrib.messages.storage.cookie.CookieStorage'
 MESSAGE_TAGS = {
@@ -298,7 +314,7 @@ REST_FRAMEWORK = {
     'rest_framework.permissions.DjangoObjectPermissions',
   ],
   'DEFAULT_FILTER_BACKENDS': [
-    'rest_framework.filters.DjangoObjectPermissionsFilter',
+    'rest_framework_guardian.filters.ObjectPermissionsFilter',
     'django_filters.rest_framework.DjangoFilterBackend',
     'rest_framework.filters.OrderingFilter',
   ],
@@ -316,39 +332,6 @@ JWT_AUTH = {
     'JWT_EXPIRATION_DELTA': datetime.timedelta(hours=6),
 }
 
-# Compressor
-COMPRESS_PRECOMPILERS = (
-    ('text/x-scss', 'django_libsass.SassCompiler'),
-)
-
-# Sass
-def theme(color):
-    from app.contexts.settings import theme as f
-    return f(color)
-
-
-def complementary(color):
-    from app.contexts.settings import complementary as f
-    return f(color)
-
-
-def scaleby(color, n):
-    from app.contexts.settings import scaleby as f
-    return f(color, n)
-
-
-def scalebyiv(color, n):
-    from app.contexts.settings import scaleby as f
-    return f(color, n, True)
-
-
-LIBSASS_CUSTOM_FUNCTIONS = {
-    'theme': theme,
-    'complementary': complementary,
-    'scaleby': scaleby,
-    'scalebyiv': scalebyiv
-}
-
 # Celery
 CELERY_BROKER_URL = os.environ.get('WO_BROKER', 'redis://localhost')
 CELERY_RESULT_BACKEND = os.environ.get('WO_BROKER', 'redis://localhost')
@@ -360,10 +343,69 @@ CELERY_INCLUDE=['worker.tasks', 'app.plugins.worker']
 CELERY_WORKER_REDIRECT_STDOUTS = False
 CELERY_WORKER_HIJACK_ROOT_LOGGER = False
 
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": os.environ.get('WO_BROKER', 'redis://localhost'),
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+        }
+    }
+}
+if DEBUG and not TESTING:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.dummy.DummyCache',
+        }
+    }
+
+# Number of minutes a processing node hasn't been seen 
+# before it should be considered offline
+NODE_OFFLINE_MINUTES = 5
+
+# When turned on, updates nodes information only when necessary
+# and assumes that all nodes are always online, avoiding polling
+NODE_OPTIMISTIC_MODE = False
+
+# URL to external auth endpoint
+EXTERNAL_AUTH_ENDPOINT = ''
+
+# URL to a page where a user can reset the password
+RESET_PASSWORD_LINK = ''
+
+# Number of hours before tasks are automatically deleted
+# from an account that is exceeding a disk quota
+QUOTA_EXCEEDED_GRACE_PERIOD = 8
+
+# Maximum number of processing nodes to show in "Processing Nodes" menus/dropdowns
+UI_MAX_PROCESSING_NODES = None
+
+# Number of hours before partial tasks
+# are removed (or None to disable)
+CLEANUP_PARTIAL_TASKS = 72
+
+# Maximum number of threads that a worker should use for processing
+WORKERS_MAX_THREADS = 1
+
+# Link to GCP docs
+GCP_DOCS_LINK = "https://docs.opendronemap.org/gcp/#gcp-file-format"
+
+# Link to general docs
+DOCS_LINK = "https://docs.opendronemap.org"
+
+# Link to task options docs
+TASK_OPTIONS_DOCS_LINK = "https://docs.opendronemap.org/arguments/"
+
 if TESTING or FLUSHING:
     CELERY_TASK_ALWAYS_EAGER = True
+    EXTERNAL_AUTH_ENDPOINT = 'http://0.0.0.0:5555/auth'
 
 try:
     from .local_settings import *
+except ImportError:
+    pass
+
+try:
+    from .settings_override import *
 except ImportError:
     pass
